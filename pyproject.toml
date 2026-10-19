@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctxfit"
+version = "0.1.1"
+description = "Drop-in context-window optimizer for any agent loop: structural compression, section budgets, framework adapters"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Calas Automations Inc." }]
+keywords = ["llm", "agents", "context-window", "token-optimization", "prompt-engineering"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+tiktoken = ["tiktoken>=0.5"]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[project.scripts]
+ctxfit = "ctxfit.cli:main"
+
+[project.urls]
+Homepage = "https://calasautomations.com"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
