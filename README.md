@@ -217,7 +217,10 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
 - **Recall.** Hidden outputs stay retrievable by their id. Add
   `recall_tool("anthropic")` (or `"openai"`) to your request's `tools`; when
   the model calls `ctxfit_recall`, answer with `keeper.handle_recall(call)`,
-  which returns the ready-made tool result.
+  which returns the ready-made tool result. The text comes back exactly as the tool
+  produced it, **unscrubbed** (secrets included): it is that conversation's own
+  data. Never share a keeper or its offload store across users or
+  conversations.
 
 **No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
 the summariser call yourself (async, a queue, another process), use the pure

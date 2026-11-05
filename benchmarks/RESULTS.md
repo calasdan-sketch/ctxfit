@@ -6,32 +6,33 @@ Method: each transcript is replayed one turn at a time; every turn is one reques
 
 - **sent** = estimated input tokens actually sent, summed over requests (baseline = no rewriting).
 - **net saved** = (baseline − sent − summariser in/out) / baseline.
-- **cache-stable** = share of requests (after the first) whose output starts with the previous request's output byte for byte (so a provider prompt cache can be reused).
-- **re-reads of hidden output** = times the agent re-ran an identical tool call whose earlier output was hidden, squeezed or summarised away in the prompt it had just seen. The transcripts are fixed, so this counts *opportunities* for a costly re-fetch, not re-fetches caused by ctxfit; a real agent may or may not re-run the call (or use `ctxfit_recall`).
+- **cache-stable** = share of requests (after the first) whose output starts with the previous request's output byte for byte (so a provider prompt cache can be reused). The baseline is 100% by construction: without rewriting, every request extends the last.
+- **last request** = estimated tokens of the final request of a transcript, averaged over the transcripts of the corpus.
+- **re-reads of hidden output** = times the agent re-ran an identical tool call whose latest earlier output was hidden, squeezed or summarised away in the prompt it had just seen (an older copy being hidden does not count if a newer one was visible). The transcripts are fixed, so this counts *opportunities* for a costly re-fetch, not re-fetches caused by ctxfit; a real agent may or may not re-run the call (or use `ctxfit_recall`).
 
 ## coding agent (3 transcripts x 32 turns)
 
 | strategy | sent (est. tokens) | net saved | summariser calls | cache-stable | last request | re-reads of hidden output |
 |---|---:|---:|---:|---:|---:|---:|
 | none (baseline) | 1,716,191 | 0.0% | 0 | 100% | 34,717 | 0 of 48 |
-| mask / hide | 593,831 | 65.4% | 0 | 77% | 5,840 | 32 of 48 |
-| mask / squeeze | 687,050 | 60.0% | 0 | 77% | 8,239 | 32 of 48 |
-| mask / hide + clear_at_least 20k | 754,041 | 56.1% | 0 | 90% | 10,060 | 25 of 48 |
-| notes, defaults (high water 60k) | 593,831 | 65.4% | 0 | 77% | 5,840 | 32 of 48 |
-| notes, high water 8k / low 4k | 542,245 | 66.1% | 8 | 69% | 4,866 | 32 of 48 |
-| notes 8k/4k + squeeze | 545,553 | 65.8% | 11 | 66% | 5,208 | 33 of 48 |
+| mask / hide | 593,831 | 65.4% | 0 | 77% | 5,840 | 15 of 48 |
+| mask / squeeze | 687,050 | 60.0% | 0 | 77% | 8,239 | 15 of 48 |
+| mask / hide + clear_at_least 20k | 754,041 | 56.1% | 0 | 90% | 10,060 | 9 of 48 |
+| notes, defaults (high water 60k) | 593,831 | 65.4% | 0 | 77% | 5,840 | 15 of 48 |
+| notes, high water 8k / low 4k | 542,245 | 66.1% | 8 | 69% | 4,866 | 15 of 48 |
+| notes 8k/4k + squeeze | 545,553 | 65.8% | 11 | 66% | 5,208 | 16 of 48 |
 
 ## research agent (3 transcripts x 26 turns)
 
 | strategy | sent (est. tokens) | net saved | summariser calls | cache-stable | last request | re-reads of hidden output |
 |---|---:|---:|---:|---:|---:|---:|
 | none (baseline) | 1,523,851 | 0.0% | 0 | 100% | 39,006 | 0 of 37 |
-| mask / hide | 622,198 | 59.2% | 0 | 80% | 10,956 | 25 of 37 |
-| mask / squeeze | 867,522 | 43.1% | 0 | 80% | 18,665 | 25 of 37 |
-| mask / hide + clear_at_least 20k | 690,538 | 54.7% | 0 | 85% | 10,956 | 25 of 37 |
-| notes, defaults (high water 60k) | 622,198 | 59.2% | 0 | 80% | 10,956 | 25 of 37 |
-| notes, high water 8k / low 4k | 530,912 | 62.6% | 14 | 61% | 7,390 | 28 of 37 |
-| notes 8k/4k + squeeze | 576,106 | 59.7% | 14 | 67% | 8,232 | 28 of 37 |
+| mask / hide | 622,198 | 59.2% | 0 | 80% | 10,956 | 18 of 37 |
+| mask / squeeze | 867,522 | 43.1% | 0 | 80% | 18,665 | 18 of 37 |
+| mask / hide + clear_at_least 20k | 690,538 | 54.7% | 0 | 85% | 10,956 | 17 of 37 |
+| notes, defaults (high water 60k) | 622,198 | 59.2% | 0 | 80% | 10,956 | 18 of 37 |
+| notes, high water 8k / low 4k | 530,912 | 62.6% | 14 | 61% | 7,390 | 20 of 37 |
+| notes 8k/4k + squeeze | 576,106 | 59.7% | 14 | 67% | 8,232 | 20 of 37 |
 
 ## Reading this honestly
 

@@ -177,3 +177,89 @@ def test_handle_recall_both_flavors():
     assert "missing" in handle_recall(bad, k.recall)["content"]
     with pytest.raises(ValueError):
         handle_recall({"foo": 1}, k.recall)
+
+
+# ---------------------------------------------------------------------------
+# panel review fixes
+# ---------------------------------------------------------------------------
+
+ANT = "sk-ant-api03-" + "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"
+
+
+def _filler(n):
+    return ("lorem ipsum dolor sit amet " * (n // 27 + 1))[:n]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _filler(290) + " " + ANT + " " + _filler(3000),  # head window
+        _filler(3000) + " " + ANT + " " + _filler(150),  # tail window
+        "\n".join([_filler(185) + " " + ANT] + [f"r{i}" for i in range(20)]),  # line cap
+        json.dumps({"note": _filler(70) + " " + ANT, "pad": _filler(3000)}),  # value cap
+        json.dumps([{"blob": _filler(280) + " " + ANT}] + [{"i": i} for i in range(200)]),
+    ],
+)
+def test_squeeze_never_leaks_a_secret_prefix(text):
+    d = squeeze_digest("t", text)
+    assert "sk-ant" not in d and "Ab3dEf" not in d
+
+
+def test_sensitive_keys_in_digest_and_args():
+    from ctxfit.notes import is_sensitive_key
+
+    for k in ("db_pass", "pass", "AWS_SECRET_ACCESS_KEY", "Authorization", "client_secret_x",
+              "credentials", "ssh_private_key", "user-passwd", "password", "api-key"):  # fmt: skip
+        assert is_sensitive_key(k), k
+    for k in ("passenger", "bypass", "tokens", "max_tokens", "keys", "author"):
+        assert not is_sensitive_key(k), k
+    d = squeeze_digest("t", json.dumps({"db_pass": "x", "n": 1, "pad": "p" * 3000}))
+    assert "db_pass = [redacted]" in d
+
+
+def test_aws_secret_scrubbed():
+    from ctxfit.notes import scrub_secrets
+
+    out = scrub_secrets("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    assert out == "aws_secret_access_key = [redacted]"
+
+
+def test_deep_json_is_not_json_and_bigints_are_doubles():
+    pad = '"' + "p" * 3000 + '"'
+    assert "array of 1 items" in squeeze_digest("t", "[" * 256 + pad + "]" * 256)
+    assert "array of" not in squeeze_digest("t", "[" * 257 + pad + "]" * 257)
+    d = squeeze_digest("t", '{"h": ' + "9" * 5000 + ', "pad": "' + "q" * 3000 + '"}')
+    assert "h = null" in d
+
+
+def test_squeeze_recursion_falls_back_to_hide(monkeypatch):
+    import ctxfit.notes as n
+
+    def boom(tool, text):
+        raise RecursionError
+
+    monkeypatch.setattr(n, "squeeze_digest", boom)
+    out, r = mask_observations(anthropic_convo(8), mask_style="squeeze")
+    assert r.masked_outputs == 4 and r.squeezed_outputs == 0
+    assert r.reasons[:2] == ["masked", "squeeze_failed"]
+
+
+def test_too_deep_input_is_passed_through():
+    v = "x"
+    for _ in range(3000):
+        v = {"a": v}
+    msgs = [
+        {"role": "user", "content": "t"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "a", "name": "b", "input": v}],
+        },
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "ok"}]},
+    ]
+    out, r = keeper(high_water_tokens=2, low_water_tokens=1).fit(msgs)
+    assert r.reasons == ["too_deep"] and out[1] is msgs[1]
+
+
+def test_recall_error_message_uses_normalised_id():
+    res = handle_recall({"type": "tool_use", "id": "x", "input": {"id": "  ABC  "}}, lambda i: None)
+    assert res["content"] == "ctxfit_recall: no stored output with id 'abc'"

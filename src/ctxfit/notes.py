@@ -87,6 +87,10 @@ from .messages import Message, detect_flavor
 STATE_VERSION = 2
 ALGO = "rn-3"
 MAX_MESSAGES = 5_000
+MAX_JSON_DEPTH = 256
+"""Tool output / arguments nested deeper than this are not treated as JSON."""
+MAX_INPUT_DEPTH = 400
+"""Messages nested deeper than this are passed through untouched (``too_deep``)."""
 """Above this many messages, masking and notes are skipped (``too_many_messages``)."""
 
 BACKOFF_CAP_TURNS = 64
@@ -171,6 +175,14 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^ \t\n\r\f\v/@:]*:[^ \t\n\r\f\v/@]+@", re.ASCII),
     ),
     (
+        "aws_secret_key",
+        re.compile(
+            r"((?:aws_)?secret_access_key|aws_secret_key)([\"']?[ \t]*[:=][ \t]*[\"']?)"
+            r"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])",
+            re.ASCII | re.IGNORECASE,
+        ),
+    ),
+    (
         "key_value",
         re.compile(
             r"(" + _KV_KEYS + r")([\"']?[ \t]*[:=][ \t]*)(\"[^\"]*\"|'[^']*'|[^ \t\n\r\f\v]+)",
@@ -181,8 +193,15 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 _SENSITIVE_KEY_RE = re.compile(
-    r"(?:.*[_-])?(?:" + _KV_KEYS + r"|authorization)", re.ASCII | re.IGNORECASE
+    r"(?:.*[_-])?(?:password|passwd|pwd|pass|api[_-]?key|access[_-]?token|auth[_-]?token|token)"
+    r"|.*(?:secret|credential|private[_-]?key|passwd|authorization).*",
+    re.ASCII | re.IGNORECASE | re.DOTALL,
 )
+
+
+def is_sensitive_key(key: Any) -> bool:
+    """True for keys whose values are always redacted (password, db_pass, client_secret, ...)."""
+    return _SENSITIVE_KEY_RE.fullmatch(str(key)) is not None
 
 
 def _scrub_value(value: Any, sensitive: bool = False) -> Any:
@@ -198,10 +217,7 @@ def _scrub_value(value: Any, sensitive: bool = False) -> Any:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return REDACTED if sensitive else value
     if isinstance(value, dict):
-        return {
-            k: _scrub_value(v, _SENSITIVE_KEY_RE.fullmatch(str(k)) is not None)
-            for k, v in value.items()
-        }
+        return {k: _scrub_value(v, is_sensitive_key(k)) for k, v in value.items()}
     if isinstance(value, list):
         return [_scrub_value(v, sensitive) for v in value]
     return value
@@ -222,11 +238,8 @@ def _render_args(raw: Any, is_text: bool) -> str:
     if is_text:
         if not isinstance(raw, str):
             return scrub_secrets(raw)
-        try:
-            parsed = json.loads(raw, parse_constant=_reject_constant)
-        except (ValueError, RecursionError):
-            return scrub_secrets(raw)
-        if not isinstance(parsed, (dict, list)):
+        parsed = _strict_json(raw)
+        if parsed is None:
             return scrub_secrets(raw)
         raw = parsed
     return scrub_secrets(_json(_scrub_value(raw)))
@@ -240,6 +253,7 @@ def _kv_sub(m: re.Match[str]) -> str:
 
 
 _REPLACEMENTS: dict[str, Any] = {
+    "aws_secret_key": lambda m: m.group(1) + m.group(2) + REDACTED,
     "bearer_token": lambda m: m.group(1) + " " + REDACTED,
     "url_credentials": lambda m: m.group(1) + REDACTED + "@",
     "key_value": _kv_sub,
@@ -795,10 +809,40 @@ def _cp_head(s: str, n: int) -> str:
     return w[:n] if len(w) > n else s
 
 
+def _json_depth_ok(text: str, limit: int) -> bool:
+    """Iterative scan: no ``[``/``{`` nesting deeper than ``limit`` outside strings."""
+    depth = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return False
+        elif ch in "]}":
+            depth -= 1
+    return True
+
+
 def _strict_json(text: str) -> Any:
-    """``JSON.parse`` semantics for an object/array (None when not one)."""
+    """``JSON.parse`` semantics for an object/array (None when not one).
+
+    Nesting deeper than 256 counts as not JSON (checked before parsing);
+    every integer is parsed as a double, as JavaScript does (so huge ones
+    become Infinity instead of failing).
+    """
+    if not isinstance(text, str) or not _json_depth_ok(text, MAX_JSON_DEPTH):
+        return None
     try:
-        v = json.loads(text, parse_constant=_reject_constant)
+        v = json.loads(text, parse_constant=_reject_constant, parse_int=float)
     except (ValueError, RecursionError):
         return None
     return v if isinstance(v, (dict, list)) else None
@@ -829,7 +873,10 @@ def _digest_json(v: Any) -> list[str]:
         val = v[k]
         if isinstance(val, dict | list):
             continue
-        shown = val if isinstance(val, str) else _json(val)
+        if is_sensitive_key(k):
+            shown = REDACTED
+        else:
+            shown = val if isinstance(val, str) else _json(val)
         lines.append(f"{k} = {_cp_head(shown, _SQUEEZE_VALUE_CAP)}")
         pairs += 1
     return lines
@@ -866,8 +913,14 @@ def _digest_lines(lines: list[str]) -> list[str]:
 
 
 def squeeze_digest(tool: str, text: str) -> str:
-    """The v3 squeeze digest of a tool output (header + scrubbed body), regardless of size."""
+    """The v3 squeeze digest of a tool output (header + scrubbed body), regardless of size.
+
+    The header's char count and id8 come from the original; the body is built
+    from the scrubbed original and scrubbed again.
+    """
     header = SQUEEZE_HEADER.format(tool=tool, n=_clen(text), id8=_sha256(text)[:8])
+    # Scrub the whole original first, so no window can cut a secret in half.
+    text = scrub_secrets(text)
     parsed = _strict_json(text)
     if parsed is not None:
         body = _digest_json(parsed)
@@ -881,11 +934,14 @@ def squeeze_digest(tool: str, text: str) -> str:
     return header + "\n" + scrub_secrets("\n".join(body))
 
 
-def _replacement(style: str, tool: str, text: str) -> tuple[str, str, bool]:
-    """(replacement text, id8, squeezed?) for an output that is being masked."""
+def _replacement(style: str, tool: str, text: str) -> tuple[str, str, bool | None]:
+    """(replacement, id8, squeezed?) for an output being masked; None = squeeze failed."""
     marker, id8 = _marker(tool, text)
     if style == "squeeze":
-        digest = squeeze_digest(tool, text)
+        try:
+            digest = squeeze_digest(tool, text)
+        except RecursionError:  # last resort: never fail the request
+            return marker, id8, None
         if SQUEEZE_MAX_RATIO_DEN * _clen(digest) <= SQUEEZE_MAX_RATIO_NUM * _clen(text):
             return digest, id8, True
     return marker, id8, False
@@ -897,6 +953,7 @@ class _Masked:
     boundary: int
     # raw index -> list of (id8, original_text, squeezed?) masked in that message
     masked_at: dict[int, list[tuple[str, str, bool]]]
+    squeeze_failed: bool = False
 
 
 def _eligible_outputs(conv: _Conversation, cfg: NotesConfig) -> list[tuple[int, int, int, str]]:
@@ -949,7 +1006,8 @@ def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = No
 
     def replace(idx: int, rpos: int, text: str) -> str:
         new, id8, squeezed = _replacement(cfg.mask_style, conv.tool_name(idx, rpos), text)
-        masked.masked_at.setdefault(idx, []).append((id8, text, squeezed))
+        masked.squeeze_failed = masked.squeeze_failed or squeezed is None
+        masked.masked_at.setdefault(idx, []).append((id8, text, bool(squeezed)))
         return new
 
     for idx, positions in targets.items():
@@ -1514,6 +1572,23 @@ def _coerce_state(state: NotesState | dict[str, Any] | None) -> tuple[NotesState
 # ---------------------------------------------------------------------------
 
 
+def _too_deep(value: Any, limit: int) -> bool:
+    """Iterative: does ``value`` nest lists/dicts deeper than ``limit`` (the list itself = 1)?"""
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        v, d = stack.pop()
+        if isinstance(v, dict):
+            children = v.values()
+        elif isinstance(v, list | tuple):
+            children = v
+        else:
+            continue
+        if d > limit:
+            return True
+        stack.extend((c, d + 1) for c in children if isinstance(c, dict | list | tuple))
+    return False
+
+
 def plan_context(
     messages: Sequence[Any],
     *,
@@ -1551,7 +1626,10 @@ def plan_context(
         raise ValueError("mode must be 'notes' or 'mask'")
     cfg = config if config is not None else NotesConfig()
     fl, raw, originals = _resolve_flavor(messages, flavor)
-    raw = copy.deepcopy(raw)
+    if _too_deep(raw, MAX_INPUT_DEPTH):  # copy shallowly: deepcopy would overflow the stack
+        raw = list(raw)
+    else:
+        raw = copy.deepcopy(raw)
     start_state, spec_changed = _coerce_state(state)
     input_state = copy.copy(start_state) if not spec_changed and state is not None else None
     plan = ContextPlan(
@@ -1568,6 +1646,9 @@ def plan_context(
     )
     if len(raw) > MAX_MESSAGES:
         plan.skip = "too_many_messages"
+        return plan
+    if _too_deep(raw, MAX_INPUT_DEPTH):
+        plan.skip = "too_deep"
         return plan
     if not force and _provider_context(fl, raw, context_management):
         plan.skip = "provider_context"
@@ -1707,6 +1788,15 @@ def finish_context(plan: ContextPlan, outcome: SummaryOutcome | None) -> Context
     fl = plan.flavor
     reasons = list(plan.reasons)
     st = copy.copy(plan.state)
+    if plan.skip == "too_deep":
+        # Nothing is measured, copied or hashed: that would overflow Python's stack.
+        state_out = plan.input_state if plan.input_state is not None else plan.state
+        out = _strip_pinned(fl, list(plan.raw))
+        report = NotesReport(reasons=["too_deep"])
+        idx0: list[int | None] = list(range(len(out)))
+        return ContextResult(
+            _restore_shape(out, idx0, plan.originals), copy.copy(state_out), report, {}
+        )
     before = _estimate(fl, plan.raw, plan.sys_chars)
     report = NotesReport(tokens_before_est=before, tokens_after_est=before, reasons=reasons)
 
@@ -1819,6 +1909,8 @@ def finish_context(plan: ContextPlan, outcome: SummaryOutcome | None) -> Context
             offload.setdefault(id8, original)
     report.offload = offload
     st.mask_boundary = masked.boundary
+    if masked.squeeze_failed:
+        reasons.insert(0, "squeeze_failed")
     if report.masked_outputs:
         reasons.insert(0, "masked")
 
@@ -2046,13 +2138,14 @@ def handle_recall(tool_call: dict[str, Any], lookup: Callable[[str], str | None]
         flavor, call_id = "openai", tool_call.get("id")
     else:
         raise ValueError("not an Anthropic tool_use block or an OpenAI tool call")
-    id8 = args.get("id") if isinstance(args, dict) else None
-    text = lookup(id8.strip().lower()) if isinstance(id8, str) else None
+    raw_id = args.get("id") if isinstance(args, dict) else None
+    id8 = raw_id.strip().lower() if isinstance(raw_id, str) else None
+    text = lookup(id8) if id8 is not None else None
     error = text is None
     if error:
         text = (
-            f"ctxfit_recall: no stored output with id {id8!r}"
-            if isinstance(id8, str)
+            f"ctxfit_recall: no stored output with id '{id8}'"
+            if id8 is not None
             else "ctxfit_recall: missing string argument 'id'"
         )
     if flavor == "anthropic":

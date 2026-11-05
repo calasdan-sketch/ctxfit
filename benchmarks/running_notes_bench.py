@@ -10,7 +10,6 @@ on transcripts shaped like real agent runs; they say nothing about task quality.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import random
 import sys
@@ -176,13 +175,13 @@ STRATEGIES = {
 def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
     tot = Totals()
     state = None
-    first_seen: dict[str, int] = {}
-    prev_hidden: set[str] = set()  # id8s hidden in the previous request's output
-    prev_cut = 0  # turns < prev_cut were summarised away (turn t = step t here)
+    last_seen: dict[str, int] = {}  # call -> latest earlier turn with that exact call
+    prev_boundary = 0  # previous request's applied mask boundary (turn t = step t here)
+    prev_cut = 0  # previous request's cut: turns < prev_cut were summarised away
     for t in range(len(steps)):
         tool, inp, out = steps[t]
         key = tool + json.dumps(inp, sort_keys=True)
-        if key in first_seen:
+        if key in last_seen:
             tot.rereads += 1
         msgs = to_messages(steps[: t + 1], task)
         if strategy is None:
@@ -196,7 +195,7 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
             if t:
                 tot.comparable += 1
                 tot.stable += 1
-            first_seen.setdefault(key, t)
+            last_seen[key] = t
             continue
         mode, extra = strategy
         cfg = NotesConfig(**{**base_cfg, **extra})
@@ -205,13 +204,15 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
         res = finish_context(plan, outcome)
         state = res.state
         r = res.report
-        if key in first_seen:
-            # Was the earlier output of this exact call hidden from the prompt the agent saw
-            # before deciding to call it again? (masked, squeezed or evicted into notes)
-            u = first_seen[key]
-            prev_out = steps[u][2]
-            id8 = hashlib.sha256(prev_out.encode()).hexdigest()[:8]
-            if id8 in prev_hidden or u < prev_cut:
+        if key in last_seen:
+            # Was the LATEST earlier copy of this exact call's output hidden from the prompt
+            # the agent saw just before calling it again? (masked/squeezed: below the previous
+            # request's boundary and eligible; or summarised away: below the previous cut)
+            u = last_seen[key]
+            eligible = (
+                len(steps[u][2]) >= cfg.min_mask_chars and steps[u][0] not in cfg.exclude_tools
+            )
+            if (u < prev_boundary and eligible) or u < prev_cut:
                 tot.rereads_hidden += 1
         tot.requests += 1
         tot.before += r.tokens_before_est
@@ -222,9 +223,9 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
         if r.cache_stable is not None:
             tot.comparable += 1
             tot.stable += bool(r.cache_stable)
-        prev_hidden = set(r.offload)
+        prev_boundary = r.mask_boundary
         prev_cut = r.cut_turn if r.notes_applied else 0
-        first_seen.setdefault(key, t)
+        last_seen[key] = t
     return tot
 
 
@@ -258,9 +259,13 @@ def main() -> int:
         "- **sent** = estimated input tokens actually sent, summed over requests (baseline = no rewriting).",
         "- **net saved** = (baseline − sent − summariser in/out) / baseline.",
         "- **cache-stable** = share of requests (after the first) whose output starts with the "
-        "previous request's output byte for byte (so a provider prompt cache can be reused).",
+        "previous request's output byte for byte (so a provider prompt cache can be reused). "
+        "The baseline is 100% by construction: without rewriting, every request extends the last.",
+        "- **last request** = estimated tokens of the final request of a transcript, averaged "
+        "over the transcripts of the corpus.",
         "- **re-reads of hidden output** = times the agent re-ran an identical tool call whose "
-        "earlier output was hidden, squeezed or summarised away in the prompt it had just seen. "
+        "latest earlier output was hidden, squeezed or summarised away in the prompt it had "
+        "just seen (an older copy being hidden does not count if a newer one was visible). "
         "The transcripts are fixed, so this counts *opportunities* for a costly re-fetch, not "
         "re-fetches caused by ctxfit; a real agent may or may not re-run the call (or use "
         "`ctxfit_recall`).",

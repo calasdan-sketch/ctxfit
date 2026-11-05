@@ -536,6 +536,7 @@ SCRUB_SAMPLES = {
     "jwt": "eyJabcde.eyJfghij.klmnopq",
     "bearer_token": "Bearer abcdefgh12345678",
     "url_credentials": "https://bob:pa55@host/x",
+    "aws_secret_key": "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     "key_value": "auth_token = abc",
 }
 
