@@ -24,8 +24,11 @@ from ctxfit import __version__  # noqa: E402
 from ctxfit.notes import (  # noqa: E402
     NotesConfig,
     SummaryOutcome,
+    _estimate,
+    canonical_json,
     finish_context,
     plan_context,
+    scrub_secrets,
 )
 
 FAKE_NOTES = ("Goal: finish the task. Facts: " + "fact; " * 200)[:1200]
@@ -152,14 +155,61 @@ class Totals:
     rereads_hidden: int = 0
     rereads: int = 0
     last_after: int = 0
+    cost: float = 0.0  # cache-priced input cost, in plain-input-token units
+    facts_total: int = 0
+    facts_visible: int = 0
     notes: list[str] = field(default_factory=list)
+
+
+CACHE_WRITE, CACHE_READ = 1.25, 0.1  # Anthropic 5-minute cache prices vs plain input
+SUMMARY_OUT_PRICE = 5.0  # output tokens typically cost ~5x input
+
+
+def prompt_text(messages: list[dict[str, Any]]) -> str:
+    """All text the model would read in these messages (tool inputs as JSON)."""
+    parts: list[str] = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+            continue
+        for b in c or []:
+            if b.get("type") == "text":
+                parts.append(b["text"])
+            elif b.get("type") == "tool_use":
+                parts.append(json.dumps(b["input"], ensure_ascii=False))
+            elif b.get("type") == "tool_result":
+                rc = b.get("content")
+                parts.append(
+                    rc if isinstance(rc, str) else "\n".join(x.get("text", "") for x in rc)
+                )
+    return "\n".join(parts)
+
+
+def all_facts(steps) -> set[str]:
+    """Every distinct fact token (rule I tokenizer, no 8-per-output limit) in the tool outputs."""
+    from ctxfit.notes import _clean_fact, _raw_fact_tokens
+
+    facts: set[str] = set()
+    for _tool, _inp, out in steps:
+        for raw in _raw_fact_tokens(scrub_secrets(out)):
+            tok = _clean_fact(raw)
+            if tok is not None and len(tok) < 80:
+                facts.add(tok)
+    return facts
 
 
 STRATEGIES = {
     "none (baseline)": None,
     "mask / hide": ("mask", {}),
     "mask / squeeze": ("mask", {"mask_style": "squeeze"}),
+    "mask / hide, keep_facts off (v3)": ("mask", {"keep_facts": False}),
+    "mask / squeeze + recent JSON tables": (
+        "mask",
+        {"mask_style": "squeeze", "squeeze_recent_json": True},
+    ),
     "mask / hide + clear_at_least 20k": ("mask", {"clear_at_least_chars": 20_000}),
+    "mask / hide + clear_at_least auto": ("mask", {"clear_at_least_chars": "auto"}),
     "notes, defaults (high water 60k)": ("notes", {}),
     "notes, high water 8k / low 4k": (
         "notes",
@@ -178,20 +228,34 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
     last_seen: dict[str, int] = {}  # call -> latest earlier turn with that exact call
     prev_boundary = 0  # previous request's applied mask boundary (turn t = step t here)
     prev_cut = 0  # previous request's cut: turns < prev_cut were summarised away
+    prev_out: list[str] = []  # canonical JSON of the previous request's output messages
+    final: list[dict[str, Any]] = []
     for t in range(len(steps)):
         tool, inp, out = steps[t]
         key = tool + json.dumps(inp, sort_keys=True)
         if key in last_seen:
             tot.rereads += 1
         msgs = to_messages(steps[: t + 1], task)
-        if strategy is None:
-            from ctxfit.notes import _estimate
 
+        def price(out: list[dict[str, Any]]) -> float:
+            nonlocal prev_out
+            cur = [canonical_json(m) for m in out]
+            k = 0
+            while k < min(len(cur), len(prev_out)) and cur[k] == prev_out[k]:
+                k += 1
+            prev_out = cur
+            cached = _estimate("anthropic", out[:k], 0)
+            total = _estimate("anthropic", out, 0)
+            return CACHE_READ * cached + CACHE_WRITE * (total - cached)
+
+        if strategy is None:
             est = _estimate("anthropic", msgs, 0)
             tot.requests += 1
             tot.before += est
             tot.after += est
             tot.last_after = est
+            tot.cost += price(msgs)
+            final = msgs
             if t:
                 tot.comparable += 1
                 tot.stable += 1
@@ -219,6 +283,9 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
         tot.after += r.tokens_after_est
         tot.summariser += r.summariser_input_tokens + r.summariser_output_tokens
         tot.summariser_calls += r.summariser_calls
+        tot.cost += price(res.messages)
+        tot.cost += r.summariser_input_tokens + SUMMARY_OUT_PRICE * r.summariser_output_tokens
+        final = res.messages
         tot.last_after = r.tokens_after_est
         if r.cache_stable is not None:
             tot.comparable += 1
@@ -226,6 +293,10 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
         prev_boundary = r.mask_boundary
         prev_cut = r.cut_turn if r.notes_applied else 0
         last_seen[key] = t
+    facts = all_facts(steps)
+    text = prompt_text(final)
+    tot.facts_total = len(facts)
+    tot.facts_visible = sum(1 for f in facts if f in text)
     return tot
 
 
@@ -261,6 +332,15 @@ def main() -> int:
         "- **cache-stable** = share of requests (after the first) whose output starts with the "
         "previous request's output byte for byte (so a provider prompt cache can be reused). "
         "The baseline is 100% by construction: without rewriting, every request extends the last.",
+        "- **cache-priced cost** = input cost with Anthropic-style prompt caching, as a share "
+        "of the baseline's cache-priced cost: per request, the leading messages identical to "
+        "the previous request's are read from cache at 0.1x, the rest is written at 1.25x; "
+        "summariser input counts 1x and its output 5x. The baseline itself benefits from "
+        "caching here (every request extends the last), so this is the fair comparison.",
+        "- **facts visible** = share of the distinct fact tokens (paths, URLs, error codes, "
+        "versions, ids; the same tokenizer ctxfit uses for `keeps:`) found anywhere in the "
+        "tool outputs that still appear verbatim in the last request. A crude proxy for "
+        "'can the model still see the specifics'; it says nothing about prose content.",
         "- **last request** = estimated tokens of the final request of a transcript, averaged "
         "over the transcripts of the corpus.",
         "- **re-reads of hidden output** = times the agent re-ran an identical tool call whose "
@@ -275,10 +355,12 @@ def main() -> int:
         lines += [
             f"## {corpus}",
             "",
-            "| strategy | sent (est. tokens) | net saved | summariser calls | cache-stable | last request | re-reads of hidden output |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| strategy | sent (est. tokens) | net saved | cache-priced cost | summariser calls "
+            "| cache-stable | last request | facts visible | re-reads of hidden output |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         base_sent = None
+        base_cost = None
         for name, strat in STRATEGIES.items():
             agg = Totals()
             for steps, task in runs:
@@ -293,13 +375,18 @@ def main() -> int:
                 agg.rereads += t.rereads
                 agg.rereads_hidden += t.rereads_hidden
                 agg.last_after += t.last_after
+                agg.cost += t.cost
+                agg.facts_total += t.facts_total
+                agg.facts_visible += t.facts_visible
             if base_sent is None:
-                base_sent = agg.after
+                base_sent, base_cost = agg.after, agg.cost
             net = (base_sent - agg.after - agg.summariser) / base_sent
             stable = agg.stable / agg.comparable if agg.comparable else 0
+            facts = agg.facts_visible / agg.facts_total if agg.facts_total else 0
             lines.append(
-                f"| {name} | {agg.after:,} | {net:.1%} | {agg.summariser_calls} | {stable:.0%} "
-                f"| {agg.last_after // len(runs):,} | {agg.rereads_hidden} of {agg.rereads} |"
+                f"| {name} | {agg.after:,} | {net:.1%} | {agg.cost / base_cost:.0%} "
+                f"| {agg.summariser_calls} | {stable:.0%} | {agg.last_after // len(runs):,} "
+                f"| {facts:.0%} | {agg.rereads_hidden} of {agg.rereads} |"
             )
         lines.append("")
     lines += [
@@ -315,6 +402,21 @@ def main() -> int:
         "transcripts: masking alone keeps every request under it. The 8k/4k rows lower the "
         "marks only to show the notes mechanics at this scale; each summariser call costs "
         "its input (the evicted turns) and that cost is subtracted in `net saved`.",
+        "- Priced with prompt caching, the picture is much less rosy than raw tokens: the "
+        "baseline already reads most of each request from cache at 0.1x, while every "
+        "boundary move rewrites the prefix and pays 1.25x on it again. Hide masking comes "
+        "out 2-8% cheaper and `clear_at_least_chars` 20k 7-19% cheaper; squeeze (bigger "
+        "digests rewritten each move) can cost more than the baseline, and notes at these "
+        "low thresholds come out MORE expensive than "
+        "doing nothing (summariser spend plus extra cache writes). Use notes for context "
+        "limits, not to save money on cached Claude traffic.",
+        "- `clear_at_least_chars: auto` behaves like the default here: with Anthropic's "
+        "prices and 4 expected reuses it only holds moves that hide less than about a third "
+        "of the prefix, and these transcripts' moves are bigger than that.",
+        "- `keeps:` facts on the markers cost a few percent of the savings and keep far more "
+        "specifics visible (compare the keep_facts off row).",
+        "- The JSON API rows in these transcripts have a list field (`tags`), so they are "
+        "not flat and never become lossless tables; the tables row equals plain squeeze here.",
         "- Squeeze keeps more of each output (head/tail, error lines, JSON shape) so it saves "
         "less than hide; whether that avoids re-reads is not something a replay can show.",
         "- Nothing here measures answer quality. JetBrains Research (Dec 2025) is the evidence "

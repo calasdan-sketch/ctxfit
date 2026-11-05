@@ -23,7 +23,7 @@ from ctxfit.notes import (
 
 
 def test_algo_is_rn3_and_old_states_are_spec_changed():
-    assert ALGO == "rn-3"
+    assert ALGO == "rn-4"
     plan = plan_context(anthropic_convo(4), state={"version": 2, "algo": "rn-2"})
     assert "spec_changed" in plan.reasons
 
@@ -235,7 +235,7 @@ def test_deep_json_is_not_json_and_bigints_are_doubles():
 def test_squeeze_recursion_falls_back_to_hide(monkeypatch):
     import ctxfit.notes as n
 
-    def boom(tool, text):
+    def boom(tool, text, **kw):
         raise RecursionError
 
     monkeypatch.setattr(n, "squeeze_digest", boom)

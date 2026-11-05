@@ -153,7 +153,7 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
-## Running notes (opt-in, 0.4.0)
+## Running notes (opt-in, 0.5.0)
 
 Long agent runs re-send the whole conversation every turn. Most of that is old
 tool output nobody will read again. `ctxfit.notes` cuts it in two layers, both
@@ -221,6 +221,28 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
   produced it, **unscrubbed** (secrets included): it is that conversation's own
   data. Never share a keeper or its offload store across users or
   conversations.
+
+**Changed in 0.5.0** (state from 0.4.0 is discarded once, `spec_changed`):
+
+- **Markers keep the key facts.** A hidden output's marker now ends with up to
+  8 specifics found in it — file paths, URLs, error codes, versions, ids —
+  e.g. `[ctxfit: tool output hidden - bash - 18234 chars - id 3f9a1c07] - keeps: app/main.py; E1234; v2.3.1`.
+  They are taken from the secret-scrubbed text. On by default
+  (`keep_facts=False` for the old one-liner).
+- **Notes say what can be recalled.** Outputs evicted by a cut stay
+  retrievable by id, and the notes message ends with
+  `[hidden outputs you can recall: 3f9a1c07 bash; ...]` (newest 20). The
+  summariser sees each result's id and is asked to cite it.
+- **Lossless tables.** With `mask_style="squeeze"`, a JSON array of flat
+  objects becomes a pipe table that keeps every value (only secrets are
+  redacted) when that is at most 75% of the original.
+  `squeeze_recent_json=True` does this for the recent turns too.
+- **Prose digest.** Squeezed prose keeps the first and last sentence and the
+  sentences with numbers or facts, instead of a blind head and tail.
+- **`clear_at_least_chars="auto"`** works out per move whether hiding is
+  worth the cache write it causes, from cache prices
+  (`cache_write_multiplier=1.25`, `cache_read_multiplier=0.1`) and how many
+  more requests you expect to reuse the prefix (`expected_reuse=4`).
 
 **No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
 the summariser call yourself (async, a queue, another process), use the pure
@@ -348,11 +370,16 @@ editing and leaves requests that already use it alone (`provider_context`).
 If you are on Claude only and want zero code, context editing is simpler. If
 you need a summary that a human can read, can audit or that works across
 providers, or a record you can recall from, that is where ctxfit fits.
+One honest caveat from our own benchmark: priced with Claude prompt caching,
+masking saves far less money than tokens (the untouched baseline is mostly
+cache reads), squeeze can cost more than doing nothing, and running notes
+cost more — they are for staying under the context limit, not for saving
+money on cached traffic.
 Savings claims of other projects are their own; ours, on synthetic
 transcripts only, are in `benchmarks/RESULTS.md` (method stated there).
 
 Exact behaviour, including how every ambiguous case is resolved, is pinned by
-shared conformance fixtures (spec v3) that the TypeScript port (calas-gateway)
+shared conformance fixtures (spec v4) that the TypeScript port (calas-gateway)
 runs too.
 
 ## Safety rules (load-bearing)
