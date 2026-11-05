@@ -448,7 +448,7 @@ def main() -> int:
         "(free, the cache is gone anyway) lowered `clear_at_least_chars` 20k from 64% to 56% "
         "(coding) and 74% to 72% (research). With `clear_at_least_chars` 0 it changes "
         "nothing, since every move already happens.",
-        "- **Notes cost money.** At these low thresholds notes cost 75-93% with pauses and "
+        "- **Notes cost money.** At these low thresholds notes cost 78-93% with pauses and "
         "116-138% without: more than doing nothing. With the default high water (60k) they "
         "never engaged. Use notes to stay under a context limit, not to save money.",
         "- **Squeeze** keeps more of each output, so it saves less and, with a warm cache, "

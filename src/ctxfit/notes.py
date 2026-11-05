@@ -76,7 +76,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -159,7 +159,10 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.ASCII,
         ),
     ),
-    ("anthropic_or_openai_key", re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_\-]{16,}", re.ASCII)),
+    (
+        "anthropic_or_openai_key",
+        re.compile(r"(?<![A-Za-z0-9])sk-(?:ant-)?[A-Za-z0-9_\-]{16,}", re.ASCII),
+    ),
     ("stripe_key", re.compile(r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{10,}", re.ASCII)),
     ("aws_access_key", re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}", re.ASCII)),
     ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}", re.ASCII)),
@@ -168,6 +171,7 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack_token", re.compile(r"xox[abposr]-[A-Za-z0-9\-]{10,}", re.ASCII)),
     ("google_api_key", re.compile(r"AIza[0-9A-Za-z_\-]{35}", re.ASCII)),
     ("huggingface_token", re.compile(r"hf_[A-Za-z0-9]{30,}", re.ASCII)),
+    ("npm_token", re.compile(r"npm_[A-Za-z0-9]{36}", re.ASCII)),
     (
         "jwt",
         re.compile(r"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}", re.ASCII),
@@ -177,14 +181,34 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"\b([Bb]earer)[ \t]+[A-Za-z0-9._~+/=\-]{8,}", re.ASCII),
     ),
     (
+        "slack_webhook",
+        re.compile(r"(https://hooks\.slack\.com/services/)[A-Za-z0-9/_\-]+", re.ASCII),
+    ),
+    (
+        "url_query_secret",
+        re.compile(
+            r"([?&](?:sig|signature|token|key|access_token|x-amz-signature|x-amz-credential|code)=)"
+            r"[^&# \t\n\r\f\v\"'<>]+",
+            re.ASCII | re.IGNORECASE,
+        ),
+    ),
+    (
         "url_credentials",
         re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^ \t\n\r\f\v/@:]*:[^ \t\n\r\f\v/@]+@", re.ASCII),
     ),
     (
         "aws_secret_key",
         re.compile(
-            r"((?:aws_)?secret_access_key|aws_secret_key)([\"']?[ \t]*[:=][ \t]*[\"']?)"
+            r"((?:aws_)?secret_access_key|aws_secret_key)([\"']?[ \t]*[:=][ \t]*[\"']?|[ \t]+)"
             r"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])",
+            re.ASCII | re.IGNORECASE,
+        ),
+    ),
+    (
+        "hex_after_key",
+        re.compile(
+            r"((?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-])*(?:" + _KV_KEYS + r"|pass|credentials?)s?)"
+            r"([ \t]+)[0-9A-Fa-f]{40}(?![0-9A-Za-z])",
             re.ASCII | re.IGNORECASE,
         ),
     ),
@@ -261,6 +285,9 @@ def _kv_sub(m: re.Match[str]) -> str:
 _REPLACEMENTS: dict[str, Any] = {
     "aws_secret_key": lambda m: m.group(1) + m.group(2) + REDACTED,
     "bearer_token": lambda m: m.group(1) + " " + REDACTED,
+    "slack_webhook": lambda m: m.group(1) + REDACTED,
+    "url_query_secret": lambda m: m.group(1) + REDACTED,
+    "hex_after_key": lambda m: m.group(1) + m.group(2) + REDACTED,
     "url_credentials": lambda m: m.group(1) + REDACTED + "@",
     "key_value": _kv_sub,
 }
@@ -880,7 +907,12 @@ def _raw_fact_tokens(text: str) -> list[str]:
         pos = max(best.end(), best.start() + 1)
 
 
+_URL_FACT_RE = re.compile(r"https?://", re.ASCII)
+
+
 def _clean_fact(token: str) -> str | None:
+    if _URL_FACT_RE.match(token):
+        token = re.split(r"[?#]", token, maxsplit=1)[0]
     token = token.rstrip(_FACT_TRAILING)
     if not token or REDACTED in token:
         return None
@@ -1067,6 +1099,8 @@ TABLE_MAX_RATIO_NUM, TABLE_MAX_RATIO_DEN = 3, 4  # table <= 75% of the original
 
 
 def _cell(v: Any) -> str:
+    if isinstance(v, _SrcNum):
+        return v.src
     if isinstance(v, str):
         ambiguous = (
             v == ""
@@ -1079,6 +1113,48 @@ def _cell(v: Any) -> str:
             return _json_str(v).replace("|", "\\|")
         return v.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "\\n").replace("\r", "\\r")
     return _json(v)
+
+
+class _SrcNum:
+    """A JSON number kept as its exact source text (tables must not round numbers)."""
+
+    __slots__ = ("src",)
+
+    def __init__(self, src: str) -> None:
+        self.src = src
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise _DuplicateKey(k)
+        out[k] = v
+    return out
+
+
+def _table_source(text: str) -> Any:
+    """Strict JSON for tables: numbers as their source text, duplicate keys rejected.
+
+    None when the text is not JSON (rule 34a's depth and constant rules), or
+    has a duplicate key anywhere: a table must give back the same JSON values.
+    """
+    if not isinstance(text, str) or not _json_depth_ok(text, MAX_JSON_DEPTH):
+        return None
+    try:
+        return json.loads(
+            text,
+            parse_int=_SrcNum,
+            parse_float=_SrcNum,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_no_duplicates,
+        )
+    except (ValueError, RecursionError):
+        return None
 
 
 def _table_lines(parsed: Any, redact: bool = True) -> list[str] | None:
@@ -1109,7 +1185,7 @@ def _table_lines(parsed: Any, redact: bool = True) -> list[str] | None:
                 cells.append("")
             elif (
                 k in sensitive
-                and isinstance(item[k], str | int | float)
+                and isinstance(item[k], str | int | float | _SrcNum)
                 and not isinstance(item[k], bool)
             ):
                 cells.append(REDACTED)
@@ -1121,7 +1197,7 @@ def _table_lines(parsed: Any, redact: bool = True) -> list[str] | None:
 
 def lossless_table(tool: str, text: str) -> str | None:
     """The v4 lossless table replacement of a tool output, or None when it does not apply."""
-    lines = _table_lines(_strict_json(scrub_secrets(text)))
+    lines = _table_lines(_table_source(scrub_secrets(text)))
     if lines is None:
         return None
     header = SQUEEZE_HEADER.format(tool=tool, n=_clen(text), id8=_sha256(text)[:8])
@@ -1315,7 +1391,7 @@ def arrival_form(text: str) -> tuple[str, str] | None:
     used only when <= 85% of the original.
     """
     try:
-        lines = _table_lines(_strict_json(text), redact=False)
+        lines = _table_lines(_table_source(text), redact=False)
     except RecursionError:
         lines = None
     candidates: list[tuple[str, str]] = []
@@ -2105,29 +2181,59 @@ def _too_deep(value: Any, limit: int) -> bool:
     return False
 
 
-def _parse_now(now: str | float | datetime | None) -> tuple[float, str]:
-    """(epoch seconds rounded to ms, ISO string) of a request time."""
+_NOW_RE = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(?:\.([0-9]{1,3}))?(Z|[+-][0-9]{2}:[0-9]{2})",
+    re.ASCII,
+)
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _ms_to_iso(ms: int) -> str:
+    dt = _EPOCH + timedelta(milliseconds=ms)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
+
+
+def parse_now(now: str | float | None) -> int:
+    """A request time as integer epoch milliseconds (spec v5 O, panel rule).
+
+    Accepts ``YYYY-MM-DDTHH:MM:SS(.f{1,3})?(Z|+HH:MM|-HH:MM)`` exactly (a real
+    calendar date, hours 0-23, minutes/seconds 0-59, offset up to 23:59) or a
+    finite epoch-seconds number, rounded as ``floor(x * 1000 + 0.5)``.
+    ``None`` means now. Anything else raises ValueError.
+    """
     if now is None:
-        t = time.time()
-        iso = datetime.fromtimestamp(t, timezone.utc).isoformat()
-    elif isinstance(now, datetime):
-        aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
-        t, iso = aware.timestamp(), now.isoformat()
-    elif isinstance(now, str):
-        raw = now[:-1] + "+00:00" if now.endswith(("Z", "z")) else now
-        try:
-            dt = datetime.fromisoformat(raw)
-        except ValueError as exc:
-            raise ValueError(f"now must be an ISO-8601 time, got {now!r}") from exc
-        if dt.tzinfo is None:
-            raise ValueError("now needs a timezone (Z or an offset)")
-        t, iso = dt.timestamp(), now
-    elif isinstance(now, int | float) and not isinstance(now, bool) and math.isfinite(now):
-        t = float(now)
-        iso = datetime.fromtimestamp(t, timezone.utc).isoformat()
-    else:
-        raise ValueError("now must be an ISO string, epoch seconds or None")
-    ms = round(t * 1000)
+        now = time.time()
+    if isinstance(now, bool):
+        raise ValueError("now must be an ISO-8601 string or epoch seconds")
+    if isinstance(now, int | float):
+        if not math.isfinite(now):
+            raise ValueError("now must be finite")
+        return math.floor(now * 1000 + 0.5)
+    if not isinstance(now, str):
+        raise ValueError("now must be an ISO-8601 string or epoch seconds")
+    m = _NOW_RE.fullmatch(now)
+    if m is None:
+        raise ValueError(f"now must look like 2026-11-05T12:00:00.000Z, got {now!r}")
+    y, mo, d, h, mi, sec, frac, tz = m.groups()
+    try:
+        dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec), tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"now is not a real time: {now!r}") from exc
+    offset = 0
+    if tz != "Z":
+        oh, om = int(tz[1:3]), int(tz[4:6])
+        if oh > 23 or om > 59:
+            raise ValueError(f"bad UTC offset in now: {now!r}")
+        offset = (oh * 60 + om) * (1 if tz[0] == "+" else -1)
+    whole = (dt - _EPOCH) // timedelta(seconds=1) - offset * 60
+    return whole * 1000 + (int((frac or "0").ljust(3, "0")) if frac else 0)
+
+
+def _parse_now(now: str | float | None) -> tuple[float, str]:
+    """(epoch seconds with ms precision, ISO string for updated_at) of a request time."""
+    ms = parse_now(now)
+    iso = now if isinstance(now, str) else _ms_to_iso(ms)
     return (ms // 1000 if ms % 1000 == 0 else ms / 1000), iso
 
 
@@ -2141,7 +2247,7 @@ def plan_context(
     state: NotesState | dict[str, Any] | None = None,
     context_management: Any = None,
     force: bool = False,
-    now: str | float | datetime | None = None,
+    now: str | float | None = None,
 ) -> ContextPlan:
     """Phase one: masking, whether the stored state applies, and where the cut moves.
 
@@ -2230,18 +2336,13 @@ def plan_context(
     current = _estimate(
         fl, _assemble(conv, masked, plan.prev_cut, plan.notes, cfg).messages, plan.sys_chars
     )
-    if plan.cache_cold:
-        # Spec v5 O: the cache is cold anyway, so a cut costs no cache write: cut from low
-        # water, as far as allowed.
-        if current <= cfg.low_water_tokens:
-            plan.reasons.append("below_low_water")
-            return plan
-    elif current <= cfg.high_water_tokens:
+    if current <= cfg.high_water_tokens:
         plan.reasons.append("below_high_water")
         return plan
     if conv.turn_count < st.retry_at_turn:
         plan.reasons.append("summariser_backoff")
         return plan
+    # Spec v5 O: when the cache is cold a cut costs no cache write, so cut as far as allowed.
     cut, reached = _choose_cut(
         conv, masked, plan.prev_cut, plan.sys_chars, cfg, latest=plan.cache_cold
     )
@@ -2758,6 +2859,12 @@ def handle_recall(tool_call: dict[str, Any], lookup: Callable[[str], str | None]
 _SEEN_MAX = 65_536
 
 
+def _clock_epoch(now: datetime) -> float:
+    """A keeper clock reading as epoch seconds (a naive datetime is taken as UTC)."""
+    aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return aware.timestamp()
+
+
 class NotesKeeper:
     """Stateful running-notes manager for ONE conversation (spec layer 1 + 2).
 
@@ -2981,7 +3088,7 @@ class NotesKeeper:
             state=self._state,
             context_management=context_management,
             force=force,
-            now=self._clock(),
+            now=_clock_epoch(self._clock()),
         )
         outcome = None
         if plan.summary is not None:
@@ -3142,6 +3249,7 @@ __all__ = [
     "mask_boundary",
     "mask_observations",
     "openai_summarizer",
+    "parse_now",
     "plan_context",
     "recall_tool",
     "sanitize_notes",

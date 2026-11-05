@@ -274,12 +274,19 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
 - **Cold-cache moments.** ctxfit remembers when the last request went out
   (`clock=` on the keeper, `now=` on `plan_context`). After more than
   `cache_ttl_seconds` (default 300; `None` turns this off), boundary moves
-  happen regardless of `clear_at_least_chars`, and running notes cut from the
-  low-water mark, as far back as allowed — rewriting is free then. Note this
-  also applies to the first request of a conversation: if it is already over
-  low water, the keeper cuts right away.
+  happen regardless of `clear_at_least_chars`, and when running notes need a
+  cut (over high water, as always) it goes as far back as allowed — rewriting
+  is free then. The first request of a conversation counts as cold.
 - Fix: an HTTP status code next to `HTTP`/`status` was counted from the wrong
   position (now matches the TypeScript port).
+- Lossless tables keep every number exactly as written (big ids, `0.10`,
+  `-0.0`) and are not used when the JSON has duplicate keys.
+- The secret scrubber also catches `sk-` keys after `_`, npm tokens, Slack
+  webhook URLs, secret URL query parameters (`sig`, `token`, `X-Amz-Signature`,
+  ...), 40-hex values after a key name like `GITHUB_TOKEN`, and AWS secrets
+  after a space. URL facts on markers drop their `?query` and `#fragment`.
+- `now=` accepts only `2026-11-05T12:00:00.000Z`-style times (with `Z` or an
+  offset) or epoch seconds; anything else is an error.
 
 **No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
 the summariser call yourself (async, a queue, another process), use the pure

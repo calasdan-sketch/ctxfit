@@ -708,7 +708,7 @@ def test_state_dict_fields():
         "algo", "failures", "retry_at_turn",
     }  # fmt: skip
     assert st["version"] == 2 and st["algo"] == "rn-5"
-    assert st["updated_at"] == "2026-11-05T00:00:00"
+    assert st["updated_at"] == "2026-11-05T00:00:00.000Z"
     assert len(st["prefix_hash"]) == 64
 
 

@@ -123,13 +123,27 @@ def test_cold_detection_and_now_parsing():
     assert finish_context(p, None).report.cache_cold is False
 
 
-def test_cold_cut_from_low_water_at_latest_boundary():
+def test_cold_cut_needs_high_water_and_lands_latest():
     msgs = anthropic_convo(10)
-    base = dict(high_water_tokens=10**6, low_water_tokens=1500, notes_max_tokens=100)
-    plan = plan_context(msgs, config=NotesConfig(**base), now=0)
-    assert plan.cache_cold and plan.cut == 6 and plan.summary is not None  # T=10, keep 4
-    warm = NotesConfig(**base, cache_ttl_seconds=None)
-    assert plan_context(msgs, config=warm).summary is None
+    base = dict(high_water_tokens=3000, low_water_tokens=2700, notes_max_tokens=100)
+    cold = plan_context(msgs, config=NotesConfig(**base), now=0)
+    warm = plan_context(msgs, config=NotesConfig(**base, cache_ttl_seconds=None))
+    assert cold.cache_cold and cold.cut == 6  # T=10, keep 4: the latest allowed boundary
+    assert warm.cut is not None and warm.cut < 6  # the earliest one reaching low water
+    high = dict(base, high_water_tokens=10**6, low_water_tokens=1500)
+    assert plan_context(msgs, config=NotesConfig(**high), now=0).summary is None
+
+
+def test_parse_now_strict():
+    from ctxfit.notes import parse_now
+
+    assert parse_now("2026-11-05T00:00:00.5Z") == 1793836800500
+    assert parse_now("2026-11-05T01:00:00+01:00") == 1793836800000
+    assert parse_now(1793836800.0005) == 1793836800001
+    for bad in ("2026-11-05T00:00:00", "2026-02-30T00:00:00Z", "2026-11-05T00:00:00.1234Z",
+                True, float("nan"), "2026-11-05T00:00:00+0100", []):  # fmt: skip
+        with pytest.raises(ValueError):
+            parse_now(bad)
 
 
 def test_keeper_uses_clock_and_skip_updates_last_request_at():
@@ -159,3 +173,89 @@ def test_keeper_arrival_reports_savings():
     k = keeper(arrival="lossless", high_water_tokens=10**7, low_water_tokens=1)
     out, r = k.fit(_convo([file, file]))
     assert r.arrival_compacted == 1 and r.arrival_saved_chars > 1000
+
+
+def _split_cells(line):
+    assert line.startswith("| ") and line.endswith(" |")
+    body, cells, cur, i = line[2:-2], [], "", 0
+    while i < len(body):
+        if body[i] == "\\" and i + 1 < len(body):
+            cur += body[i : i + 2]
+            i += 2
+        elif body.startswith(" | ", i):
+            cells.append(cur)
+            cur, i = "", i + 3
+        else:
+            cur += body[i]
+            i += 1
+    return cells + [cur]
+
+
+def _decode(cell):
+    import re as _re
+
+    if cell.startswith('"'):
+        return ("s", json.loads(cell.replace("\\|", "|")))
+    if cell in ("true", "false", "null"):
+        return ("c", cell)
+    if _re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", cell):
+        return ("n", cell)
+    out, i = "", 0
+    while i < len(cell):
+        if cell[i] == "\\":
+            out += {"\\": "\\", "|": "|", "n": "\n", "r": "\r"}[cell[i + 1]]
+            i += 2
+        else:
+            out += cell[i]
+            i += 1
+    return ("s", out)
+
+
+def _typed(v):
+    if isinstance(v, str):
+        return ("s", v)
+    if v is True or v is False or v is None:
+        return ("c", json.dumps(v))
+    return ("n", v)
+
+
+def test_lossless_table_round_trips_values_exactly():
+    import random
+
+    rng = random.Random(3)
+    nums = ["12345678901234567891", "0.10", "-0.0", "1e400", "1E+2", "2.50e-3", "0", "-7"]
+    strs = ["", "a|b", "x\ny", "back\\slash", " lead", "trail ", '"q', "42", "null", "é", "\\n"]
+    for _ in range(200):
+        items = []
+        for _r in range(rng.randint(3, 6)):
+            parts = []
+            for k in rng.sample(["a", "b", "c", "10"], rng.randint(1, 4)):
+                v = rng.choice([rng.choice(nums), json.dumps(rng.choice(strs)), "true", "null"])
+                parts.append(f'"{k}": {v}')
+            items.append("{" + ", ".join(parts) + "}")
+        src = "[" + ",\n".join(items) + "]"
+        form = arrival_form(src)
+        lines = form[0].split("\n")[1:] if form and form[1] == "table" else None
+        if lines is None:
+            from ctxfit.notes import _table_lines, _table_source
+
+            lines = _table_lines(_table_source(src), redact=False)
+        keys = [_decode(c)[1] for c in _split_cells(lines[0])]
+        want = json.loads(src, parse_int=lambda x: ("n", x), parse_float=lambda x: ("n", x))
+        for row, item in zip(lines[1:], want):
+            got = {k: _decode(c) for k, c in zip(keys, _split_cells(row)) if c != ""}
+            assert got == {k: v if isinstance(v, tuple) else _typed(v) for k, v in item.items()}
+
+
+def test_no_table_with_duplicate_keys():
+    from ctxfit.notes import lossless_table
+
+    rows = "[" + ",".join(f'{{"id": {i}, "id": {i}, "pad": "{"p" * 40}"}}' for i in range(6)) + "]"
+    assert lossless_table("t", rows) is None and arrival_form(rows) is None
+
+
+def test_url_facts_drop_query_and_fragment():
+    assert extract_facts("see https://a.io/p/q.html?x=1#top and https://b.io/r#s") == [
+        "https://a.io/p/q.html",
+        "https://b.io/r",
+    ]

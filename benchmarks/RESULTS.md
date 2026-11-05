@@ -27,9 +27,9 @@ Method: each transcript is replayed one turn at a time; every turn is one reques
 | mask / hide, keep_facts off | 593,831 | 65.4% | 63% | 90% | 0 | 77% | 5,840 | 18% | 15 of 48 |
 | mask / squeeze | 714,756 | 58.4% | 70% | 98% | 0 | 77% | 8,939 | 28% | 15 of 48 |
 | notes, defaults (high water 60k) | 621,539 | 63.8% | 65% | 92% | 0 | 77% | 6,540 | 26% | 15 of 48 |
-| notes 8k/4k | 539,483 | 66.1% | 79% | 122% | 12 | 66% | 5,109 | 19% | 16 of 48 |
+| notes 8k/4k | 542,954 | 66.0% | 82% | 122% | 10 | 67% | 5,079 | 18% | 16 of 48 |
 | notes 8k/4k, cold moments off | 542,954 | 66.0% | 82% | 122% | 10 | 67% | 5,079 | 18% | 16 of 48 |
-| notes 8k/4k + arrival | 510,925 | 67.8% | 75% | 116% | 12 | 66% | 4,864 | 19% | 16 of 48 |
+| notes 8k/4k + arrival | 513,326 | 67.7% | 78% | 116% | 10 | 67% | 4,834 | 18% | 16 of 48 |
 
 ## research agent (3 transcripts x 26 turns)
 
@@ -55,7 +55,7 @@ Method: each transcript is replayed one turn at a time; every turn is one reques
 - **What saves real money with caching:** lossless arrival compaction. It changes each output once, when it first arrives (before anything is cached), so every request still extends the last one (cache-stable 100%) and every fact stays visible. Here it cost 77-79% (coding) and 52-53% (research) of the baseline. Most of that is exact duplicates: these agents re-read the same files and pages, which real agents do too, but your mileage depends on how often yours does.
 - **Masking pays mostly through pauses.** With pauses, hide masking cost 65-76%; with the cache always warm, 92-98% (each boundary move rewrites the prefix at 1.25x, which eats most of what it saves). Adding arrival and `clear_at_least_chars` 20k is the cheapest setup here: 51-57% with pauses, 73-74% without.
 - **Cold-cache moments help a little.** Moving held-back boundaries during a pause (free, the cache is gone anyway) lowered `clear_at_least_chars` 20k from 64% to 56% (coding) and 74% to 72% (research). With `clear_at_least_chars` 0 it changes nothing, since every move already happens.
-- **Notes cost money.** At these low thresholds notes cost 75-93% with pauses and 116-138% without: more than doing nothing. With the default high water (60k) they never engaged. Use notes to stay under a context limit, not to save money.
+- **Notes cost money.** At these low thresholds notes cost 78-93% with pauses and 116-138% without: more than doing nothing. With the default high water (60k) they never engaged. Use notes to stay under a context limit, not to save money.
 - **Squeeze** keeps more of each output, so it saves less and, with a warm cache, can cost more than the baseline (116% on research).
 - `keeps:` facts cost 1-2 points and keep far more specifics visible; `clear_at_least_chars: auto` behaves like 0 here (these moves are big enough).
 - The coding transcripts' JSON rows have a list field, so they never become tables; the research corpus has no tables either. Tables are not what drives these numbers.

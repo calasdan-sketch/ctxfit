@@ -548,6 +548,10 @@ SCRUB_SAMPLES = {
     "bearer_token": "Bearer abcdefgh12345678",
     "url_credentials": "https://bob:pa55@host/x",
     "aws_secret_key": "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "npm_token": "npm_" + "a" * 36,
+    "slack_webhook": "https://hooks.slack.com/services/T0/B0/xyz",
+    "url_query_secret": "https://x.io/?signature=abcdef",
+    "hex_after_key": "GITHUB_TOKEN " + "a1" * 20,
     "key_value": "auth_token = abc",
 }
 
@@ -1013,3 +1017,19 @@ def test_blank_first_user_message_is_not_the_task():
     assert msgs[0] not in out
     plan = plan_context([{"role": "user", "content": " \n"}], config=CFG)
     assert not plan.conv.views[0].pinned  # no non-blank user message: nothing pinned
+
+
+@needs_fixtures
+def test_fixture_facts_and_now():
+    from ctxfit.notes import extract_facts, parse_now
+
+    data = json.loads((FIXTURES / "facts-01-tokens.json").read_text(encoding="utf-8"))
+    for case in data["cases"]:
+        assert extract_facts(scrub_secrets(case["input"]), 8) == case["expected"]
+    data = json.loads((FIXTURES / "now-01-parsing.json").read_text(encoding="utf-8"))
+    for case in data["cases"]:
+        if case["ms"] is None:
+            with pytest.raises(ValueError):
+                parse_now(case["input"])
+        else:
+            assert parse_now(case["input"]) == case["ms"]
