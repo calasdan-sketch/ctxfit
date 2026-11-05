@@ -107,7 +107,10 @@ class FakeSummarizer:
 
 
 def keeper(summ=None, **kw):
-    cfg = dict(high_water_tokens=3000, low_water_tokens=1500, notes_max_tokens=100)
+    # cache_ttl_seconds=None: these tests predate cold-cache moments (spec v5 O)
+    cfg = dict(
+        high_water_tokens=3000, low_water_tokens=1500, notes_max_tokens=100, cache_ttl_seconds=None
+    )
     cfg.update(kw)
     return NotesKeeper(summ or FakeSummarizer(), **cfg)
 
@@ -672,21 +675,25 @@ def test_state_round_trip_through_json():
     out2, r2 = k2.fit(msgs)
     assert s2.calls == []
     assert out2 == out1 and r2.state_reused and r2.cache_stable is True
-    assert k2.state_dict() == json.loads(blob) | {"updated_at": k2.state_dict()["updated_at"]}
+    now = k2.state_dict()
+    assert now == json.loads(blob) | {
+        "updated_at": now["updated_at"],
+        "last_request_at": now["last_request_at"],
+    }
 
 
 def test_load_state_rejects_bad_input():
     k = keeper()
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-4", "cut_turn": -1})
+        k.load_state({"version": 2, "algo": "rn-5", "cut_turn": -1})
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-4", "failures": True})
+        k.load_state({"version": 2, "algo": "rn-5", "failures": True})
     with pytest.raises(ValueError):
         k.load_state(
-            {"version": 2, "algo": "rn-4", "cut_turn": 3, "notes": None, "prefix_hash": "x"}
+            {"version": 2, "algo": "rn-5", "cut_turn": 3, "notes": None, "prefix_hash": "x"}
         )
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-4", "notes": 5})
+        k.load_state({"version": 2, "algo": "rn-5", "notes": 5})
     with pytest.raises(ValueError):
         k.load_state("nope")  # type: ignore[arg-type]
 
@@ -700,7 +707,7 @@ def test_state_dict_fields():
         "summariser_calls", "summariser_input_tokens", "summariser_output_tokens", "updated_at",
         "algo", "failures", "retry_at_turn",
     }  # fmt: skip
-    assert st["version"] == 2 and st["algo"] == "rn-4"
+    assert st["version"] == 2 and st["algo"] == "rn-5"
     assert st["updated_at"] == "2026-11-05T00:00:00"
     assert len(st["prefix_hash"]) == 64
 
@@ -848,7 +855,7 @@ def test_top_level_exports():
     for name in ("mask_observations", "NotesKeeper", "NotesReport", "MaskReport",
                  "anthropic_summarizer", "openai_summarizer", "scrub_secrets"):  # fmt: skip
         assert hasattr(ctxfit, name)
-    assert ctxfit.__version__ == "0.5.0"
+    assert ctxfit.__version__ == "0.6.0"
 
 
 # ---------------------------------------------------------------------------

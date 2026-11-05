@@ -73,6 +73,7 @@ import math
 import queue
 import re
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -86,7 +87,7 @@ from .messages import Message, detect_flavor
 # ---------------------------------------------------------------------------
 
 STATE_VERSION = 2
-ALGO = "rn-4"
+ALGO = "rn-5"
 MAX_MESSAGES = 5_000
 MAX_JSON_DEPTH = 256
 """Tool output / arguments nested deeper than this are not treated as JSON."""
@@ -118,6 +119,9 @@ NO_NOTES_YET = "(none yet)"
 
 MASK_MARKER = "[ctxfit: tool output hidden - {tool} - {n} chars - id {id8}]"
 SQUEEZE_HEADER = "[ctxfit: tool output squeezed - {tool} - {n} chars - id {id8}]"
+DUPLICATE_MARKER = "[ctxfit: identical to earlier output id {id8}]"
+LOSSLESS_HEADER = "[ctxfit: lossless - {kind}]"
+ARRIVAL_MODES = ("off", "lossless")
 MASK_STYLES = ("hide", "squeeze")
 RECALL_TOOL_NAME = "ctxfit_recall"
 NOTES_HEADER = (
@@ -806,7 +810,7 @@ _HTTP_KW_RE = re.compile(r"status|http", re.ASCII | re.IGNORECASE)
 def _cond_http(text: str, m: re.Match[str]) -> bool:
     s = m.start()
     base = max(0, s - _HTTP_KW_WINDOW - 6)
-    return any(base + k.end() >= s - _HTTP_KW_WINDOW for k in _HTTP_KW_RE.finditer(text, base, s))
+    return any(k.end() >= s - _HTTP_KW_WINDOW for k in _HTTP_KW_RE.finditer(text, base, s))
 
 
 def _cond_hex(text: str, m: re.Match[str]) -> bool:
@@ -1077,7 +1081,7 @@ def _cell(v: Any) -> str:
     return _json(v)
 
 
-def _table_lines(parsed: Any) -> list[str] | None:
+def _table_lines(parsed: Any, redact: bool = True) -> list[str] | None:
     """Spec v4 K: a lossless pipe table for an array of >= 3 flat objects, else None."""
     if not isinstance(parsed, list) or len(parsed) < _TABLE_MIN_ROWS:
         return None
@@ -1096,7 +1100,7 @@ def _table_lines(parsed: Any) -> list[str] | None:
                     return None
     if not keys:
         return None
-    sensitive = {k for k in keys if is_sensitive_key(k)}
+    sensitive = {k for k in keys if redact and is_sensitive_key(k)}
     lines = ["| " + " | ".join(_cell(k) for k in keys) + " |"]
     for item in parsed:
         cells = []
@@ -1200,6 +1204,11 @@ class _Masked:
     # raw index -> list of (id8, original_text, kind) replaced in that message
     masked_at: dict[int, list[tuple[str, str, str]]]
     squeeze_failed: bool = False
+    # (index, result position) -> (original text, status, text only?, replaceable?, form)
+    # status: "full" (unchanged), "arrival" (lossless form), "masked" (anything else)
+    outputs: dict[tuple[int, int], tuple[str, str, bool, bool, str | None]] = field(
+        default_factory=dict
+    )
 
 
 def _eligible_outputs(conv: _Conversation, cfg: NotesConfig) -> list[tuple[int, int, int, str]]:
@@ -1227,7 +1236,7 @@ def auto_clear_threshold(prefix_chars: int, cfg: NotesConfig) -> int:
 
 
 def _choose_boundary(
-    conv: _Conversation, cfg: NotesConfig, stored: int, sys_chars: int
+    conv: _Conversation, cfg: NotesConfig, stored: int, sys_chars: int, cold: bool = False
 ) -> tuple[_Masked, int | None]:
     """Applied mask boundary (v3 F2 + v4 M) and its masking; also the threshold used.
 
@@ -1245,7 +1254,9 @@ def _choose_boundary(
         if stored <= turn < formula
     )
     at_formula = _apply_mask(conv, cfg, formula)
-    if cfg.clear_at_least_chars == "auto":
+    if cold:  # spec v5 O: nothing cached to lose
+        threshold = 0
+    elif cfg.clear_at_least_chars == "auto":
         end = conv.turn_start.get(formula, len(conv.raw))
         prefix = sys_chars + sum(_message_chars(conv.flavor, m) for m in at_formula.messages[:end])
         threshold = auto_clear_threshold(prefix, cfg)
@@ -1254,6 +1265,74 @@ def _choose_boundary(
     if newly >= threshold:
         return at_formula, threshold
     return _apply_mask(conv, cfg, stored), threshold
+
+
+_TEXT_PART_TYPES = ("text", "input_text")
+
+
+def _text_only(content: Any) -> bool:
+    """A tool output made only of text (string, or a list of text parts / strings)."""
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return content is None
+    return all(
+        isinstance(p, str) or (isinstance(p, dict) and p.get("type") in _TEXT_PART_TYPES)
+        for p in content
+    )
+
+
+def _run_collapse(text: str) -> str | None:
+    """Spec v5 N3: >= 3 identical consecutive lines -> `line  [xN]` (None if not applicable)."""
+    if "  [x" in text:
+        return None
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    changed = False
+    while i < len(lines):
+        j = i
+        while j < len(lines) and lines[j] == lines[i]:
+            j += 1
+        if j - i >= 3:
+            out.append(f"{lines[i]}  [x{j - i}]")
+            changed = True
+        else:
+            out.extend(lines[i:j])
+        i = j
+    return "\n".join(out) if changed else None
+
+
+ARRIVAL_MAX_RATIO_NUM, ARRIVAL_MAX_RATIO_DEN = 17, 20  # <= 85% of the original
+
+
+@functools.lru_cache(maxsize=4096)
+def arrival_form(text: str) -> tuple[str, str] | None:
+    """Spec v5 N2/N3: (lossless form, kind) of one output's ORIGINAL text, or None.
+
+    Pure per output (no scrubbing, no redaction: the content was in the prompt
+    already and stays equivalent). Tried in order: lossless table, run collapse;
+    used only when <= 85% of the original.
+    """
+    try:
+        lines = _table_lines(_strict_json(text), redact=False)
+    except RecursionError:
+        lines = None
+    candidates: list[tuple[str, str]] = []
+    if lines is not None:
+        candidates.append(("table", "\n".join(lines)))
+    runs = _run_collapse(text)
+    if runs is not None:
+        candidates.append(("runs", runs))
+    for kind, body in candidates:
+        form = LOSSLESS_HEADER.format(kind=kind) + "\n" + body
+        if _fits(form, text, ARRIVAL_MAX_RATIO_NUM, ARRIVAL_MAX_RATIO_DEN):
+            return form, kind
+    return None
+
+
+def _result_positions(conv: _Conversation, idx: int) -> range:
+    return range(len(conv.views[idx].results)) if conv.flavor == "anthropic" else range(1)
 
 
 def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = None) -> _Masked:
@@ -1265,27 +1344,40 @@ def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = No
     out = copy.deepcopy(conv.raw)
     masked = _Masked(out, b, {})
     recent = cfg.squeeze_recent_json and cfg.mask_style == "squeeze"
-    targets: dict[int, set[int]] = {}
-    for idx, rpos, turn, _text in _eligible_outputs(conv, cfg):
-        if turn < b or recent:
-            targets.setdefault(idx, set()).add(rpos)
-    if not targets:
-        return masked
+    eligible = {(idx, rpos) for idx, rpos, _t, _x in _eligible_outputs(conv, cfg)}
+    excluded = set(cfg.exclude_tools)
 
-    def replace(idx: int, rpos: int, text: str) -> str | None:
+    def decide(idx: int, rpos: int, text: str, content: Any) -> str | None:
+        """New content text for this output, or None to leave it as it is."""
+        v = conv.views[idx]
         tool = conv.tool_name(idx, rpos)
-        if conv.views[idx].turn >= b:  # keep-recent window: lossless tables only
-            got = _recent_table_cached(tool, text)
-            if got is None:
-                return None
-            new, id8, kind = got
-        else:
+        text_only = _text_only(content)
+        dup_ok = text_only and not v.pinned and tool not in excluded
+        if (idx, rpos) in eligible and v.turn < b:
             new, id8, kind = _replacement(cfg, tool, text)
-        masked.squeeze_failed = masked.squeeze_failed or kind == "failed"
-        masked.masked_at.setdefault(idx, []).append((id8, text, kind))
-        return new
+            masked.squeeze_failed = masked.squeeze_failed or kind == "failed"
+            masked.masked_at.setdefault(idx, []).append((id8, text, kind))
+            masked.outputs[(idx, rpos)] = (text, "masked", text_only, dup_ok, None)
+            return new
+        if cfg.arrival == "lossless" and dup_ok:
+            got = arrival_form(text)
+            if got is not None:
+                masked.outputs[(idx, rpos)] = (text, "arrival", text_only, dup_ok, got[0])
+                return got[0]
+        if recent and (idx, rpos) in eligible:
+            rt = _recent_table_cached(tool, text)
+            if rt is not None:
+                new, id8, kind = rt
+                masked.masked_at.setdefault(idx, []).append((id8, text, kind))
+                masked.outputs[(idx, rpos)] = (text, "masked", text_only, dup_ok, None)
+                return new
+        masked.outputs[(idx, rpos)] = (text, "full", text_only, dup_ok, None)
+        return None
 
-    for idx, positions in targets.items():
+    for v in conv.views:
+        if not v.results:
+            continue
+        idx = v.index
         m = out[idx]
         if conv.flavor == "anthropic":
             content = m.get("content")
@@ -1295,23 +1387,73 @@ def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = No
             rpos = 0
             for blk in content:
                 if isinstance(blk, dict) and blk.get("type") == "tool_result":
-                    if rpos in positions:
-                        text = _anthropic_result_text(blk)
-                        new = replace(idx, rpos, text)
-                        if new is not None:
-                            blk = dict(blk)
-                            if isinstance(blk.get("content"), list):
-                                blk["content"] = [{"type": "text", "text": new}]
-                            else:
-                                blk["content"] = new
+                    text = _anthropic_result_text(blk)
+                    new = decide(idx, rpos, text, blk.get("content", ""))
+                    if new is not None:
+                        blk = dict(blk)
+                        _set_result(blk, "content", new)
                     rpos += 1
                 new_blocks.append(blk)
             m["content"] = new_blocks
         else:
-            new = replace(idx, 0, conv.views[idx].results[0][1])
+            new = decide(idx, 0, v.results[0][1], m.get("content"))
             if new is not None:
-                m["content"] = new
+                _set_result(m, "content", new)
     return masked
+
+
+def _set_result(holder: dict[str, Any], key: str, new: str) -> None:
+    """A content list becomes one text block; anything else becomes the string."""
+    holder[key] = [{"type": "text", "text": new}] if isinstance(holder.get(key), list) else new
+
+
+def _apply_duplicates(
+    conv: _Conversation,
+    masked: _Masked,
+    messages: list[dict[str, Any]],
+    origins: Sequence[int | None],
+    arrival_on: bool,
+) -> list[tuple[str, str, str]]:
+    """Spec v5 N1 on the assembled output, in place: a text-only output identical to an
+    earlier output shown in full (unchanged or in a lossless form) becomes a reference.
+
+    Returns (original text, new text, kind) of every lossless arrival form present.
+    """
+    seen: set[str] = set()
+    present: list[tuple[str, str, str]] = []
+    for m, origin in zip(messages, origins):
+        if origin is None:
+            continue
+        positions = _result_positions(conv, origin)
+        if not conv.views[origin].results:
+            continue
+        holders: list[dict[str, Any]] = []
+        if conv.flavor == "anthropic":
+            content = m.get("content")
+            if isinstance(content, list):
+                holders = [
+                    b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"
+                ]
+        else:
+            holders = [m]
+        for rpos, holder in zip(positions, holders):
+            info = masked.outputs.get((origin, rpos))
+            if info is None:
+                continue
+            text, status, text_only, dup_ok, form = info
+            if status == "masked":
+                continue
+            if dup_ok and arrival_on and text in seen:
+                ref = DUPLICATE_MARKER.format(id8=_sha256(text)[:8])
+                if _fits(ref, text, ARRIVAL_MAX_RATIO_NUM, ARRIVAL_MAX_RATIO_DEN):
+                    _set_result(holder, "content", ref)
+                    present.append((text, ref, "duplicate"))
+                    continue
+            if text_only:
+                seen.add(text)
+            if status == "arrival" and form is not None:
+                present.append((text, form, "lossless"))
+    return present
 
 
 # ---------------------------------------------------------------------------
@@ -1426,11 +1568,20 @@ class NotesConfig:
     cache_write_multiplier: float = 1.25
     cache_read_multiplier: float = 0.1
     expected_reuse: float = 4
+    arrival: str = "off"
+    cache_ttl_seconds: float | None = 300
 
     def __post_init__(self) -> None:
         special = {"exclude_tools", "mask_style", "clear_at_least_chars", "keep_facts",
                    "squeeze_recent_json", "cache_write_multiplier", "cache_read_multiplier",
-                   "expected_reuse"}  # fmt: skip
+                   "expected_reuse", "arrival", "cache_ttl_seconds"}  # fmt: skip
+        if self.arrival not in ARRIVAL_MODES:
+            raise ValueError("arrival must be 'off' or 'lossless'")
+        ttl = self.cache_ttl_seconds
+        if ttl is not None and (
+            not isinstance(ttl, int | float) or isinstance(ttl, bool) or not ttl >= 0
+        ):
+            raise ValueError("cache_ttl_seconds must be a number >= 0 or None")
         for f in dataclasses.fields(self):
             if f.name in special:
                 continue
@@ -1517,6 +1668,7 @@ class NotesState:
     failures: int = 0
     retry_at_turn: int = 0
     mask_boundary: int = 0
+    last_request_at: float | None = None
     updated_at: str | None = None
     last_output_hash: str | None = None
     last_output_len: int = 0
@@ -1551,6 +1703,12 @@ class NotesState:
             if v is not None and not isinstance(v, str):
                 raise ValueError(f"state field {key!r} must be a string or null")
             setattr(s, key, v)
+        t = d.get("last_request_at")
+        if t is not None and (
+            not isinstance(t, int | float) or isinstance(t, bool) or not math.isfinite(t)
+        ):
+            raise ValueError("state field 'last_request_at' must be a number or null")
+        s.last_request_at = t
         if s.cut_turn > 0 and (s.prefix_hash is None or s.notes is None):
             raise ValueError("state with cut_turn > 0 needs prefix_hash and notes")
         return s
@@ -1564,6 +1722,9 @@ class NotesState:
             h, n = get("last_output_hash"), get("last_output_len")
             if isinstance(h, str) and isinstance(n, int) and not isinstance(n, bool) and n >= 0:
                 s.last_output_hash, s.last_output_len = h, n
+            t = get("last_request_at")
+            if isinstance(t, int | float) and not isinstance(t, bool) and math.isfinite(t):
+                s.last_request_at = t
         return s
 
 
@@ -1651,6 +1812,8 @@ class MaskReport:
     reasons: list[str] = field(default_factory=list)
     squeezed_outputs: int = 0
     lossless_tables: int = 0
+    arrival_compacted: int = 0
+    arrival_saved_chars: int = 0
 
     @property
     def saved_tokens_est(self) -> int:
@@ -1680,6 +1843,8 @@ class MaskReport:
             "masked_chars": self.masked_chars,
             "squeezed_outputs": self.squeezed_outputs,
             "lossless_tables": self.lossless_tables,
+            "arrival_compacted": self.arrival_compacted,
+            "arrival_saved_chars": self.arrival_saved_chars,
             "tokens_before_est": self.tokens_before_est,
             "tokens_after_est": self.tokens_after_est,
             "saved_tokens_est": self.saved_tokens_est,
@@ -1711,6 +1876,9 @@ class NotesReport:
     squeezed_outputs: int = 0
     lossless_tables: int = 0
     clear_threshold_chars: int | None = None
+    arrival_compacted: int = 0
+    arrival_saved_chars: int = 0
+    cache_cold: bool = False
     notes_applied: bool = False
     evicted_messages: int = 0
     summariser_calls: int = 0
@@ -1802,6 +1970,8 @@ class ContextPlan:
     input_state: NotesState | None
     reasons: list[str]
     now: str | None
+    now_epoch: float = 0.0
+    cache_cold: bool = False
     conv: _Conversation | None = None
     masked: _Masked | None = None
     prev_cut: int = 0
@@ -1935,6 +2105,32 @@ def _too_deep(value: Any, limit: int) -> bool:
     return False
 
 
+def _parse_now(now: str | float | datetime | None) -> tuple[float, str]:
+    """(epoch seconds rounded to ms, ISO string) of a request time."""
+    if now is None:
+        t = time.time()
+        iso = datetime.fromtimestamp(t, timezone.utc).isoformat()
+    elif isinstance(now, datetime):
+        aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        t, iso = aware.timestamp(), now.isoformat()
+    elif isinstance(now, str):
+        raw = now[:-1] + "+00:00" if now.endswith(("Z", "z")) else now
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"now must be an ISO-8601 time, got {now!r}") from exc
+        if dt.tzinfo is None:
+            raise ValueError("now needs a timezone (Z or an offset)")
+        t, iso = dt.timestamp(), now
+    elif isinstance(now, int | float) and not isinstance(now, bool) and math.isfinite(now):
+        t = float(now)
+        iso = datetime.fromtimestamp(t, timezone.utc).isoformat()
+    else:
+        raise ValueError("now must be an ISO string, epoch seconds or None")
+    ms = round(t * 1000)
+    return (ms // 1000 if ms % 1000 == 0 else ms / 1000), iso
+
+
 def plan_context(
     messages: Sequence[Any],
     *,
@@ -1945,7 +2141,7 @@ def plan_context(
     state: NotesState | dict[str, Any] | None = None,
     context_management: Any = None,
     force: bool = False,
-    now: str | None = None,
+    now: str | float | datetime | None = None,
 ) -> ContextPlan:
     """Phase one: masking, whether the stored state applies, and where the cut moves.
 
@@ -1966,7 +2162,10 @@ def plan_context(
             present the request is skipped (``provider_context``).
         force: rewrite even when provider-native context management is in
             use (thinking blocks, compaction, ...).
-        now: ISO time stored as ``updated_at`` when the cut moves.
+        now: the request time: an ISO-8601 string with ``Z`` or an offset, or
+            epoch seconds (default: the current time). Decides whether the
+            provider cache is cold (``cache_ttl_seconds``) and is stored as
+            ``last_request_at``; the ISO form is ``updated_at`` when the cut moves.
     """
     if mode not in ("notes", "mask"):
         raise ValueError("mode must be 'notes' or 'mask'")
@@ -1988,8 +2187,12 @@ def plan_context(
         state=start_state,
         input_state=input_state,
         reasons=[],
-        now=now,
+        now=None,
     )
+    plan.now_epoch, plan.now = _parse_now(now)
+    last = plan.state.last_request_at
+    ttl = cfg.cache_ttl_seconds
+    plan.cache_cold = ttl is not None and (last is None or plan.now_epoch - last > ttl)
     if len(raw) > MAX_MESSAGES:
         plan.skip = "too_many_messages"
         return plan
@@ -2018,7 +2221,7 @@ def plan_context(
             plan.reasons.append("history_forked")
             plan.state = NotesState.carry_cache(st)
     masked, plan.clear_threshold = _choose_boundary(
-        conv, cfg, plan.state.mask_boundary, plan.sys_chars
+        conv, cfg, plan.state.mask_boundary, plan.sys_chars, plan.cache_cold
     )
     plan.masked = masked
     if mode != "notes":
@@ -2027,13 +2230,21 @@ def plan_context(
     current = _estimate(
         fl, _assemble(conv, masked, plan.prev_cut, plan.notes, cfg).messages, plan.sys_chars
     )
-    if current <= cfg.high_water_tokens:
+    if plan.cache_cold:
+        # Spec v5 O: the cache is cold anyway, so a cut costs no cache write: cut from low
+        # water, as far as allowed.
+        if current <= cfg.low_water_tokens:
+            plan.reasons.append("below_low_water")
+            return plan
+    elif current <= cfg.high_water_tokens:
         plan.reasons.append("below_high_water")
         return plan
     if conv.turn_count < st.retry_at_turn:
         plan.reasons.append("summariser_backoff")
         return plan
-    cut, reached = _choose_cut(conv, masked, plan.prev_cut, plan.sys_chars, cfg)
+    cut, reached = _choose_cut(
+        conv, masked, plan.prev_cut, plan.sys_chars, cfg, latest=plan.cache_cold
+    )
     if cut is None:
         plan.reasons.append("no_cut_allowed")
         return plan
@@ -2049,9 +2260,18 @@ def plan_context(
 
 
 def _choose_cut(
-    conv: _Conversation, masked: _Masked, prev_cut: int, sys_chars: int, cfg: NotesConfig
+    conv: _Conversation,
+    masked: _Masked,
+    prev_cut: int,
+    sys_chars: int,
+    cfg: NotesConfig,
+    latest: bool = False,
 ) -> tuple[int | None, bool]:
-    """Earliest allowed boundary reaching low water, else the latest allowed one. O(messages)."""
+    """Earliest allowed boundary reaching low water, else the latest allowed one. O(messages).
+
+    With ``latest`` (cold cache) always the latest allowed one.
+    """
+    want_latest = latest
     first = max(prev_cut + cfg.min_evict_turns, 1)
     last = min(conv.turn_count - cfg.keep_recent_turns, conv.turn_count - 1)
     if first > last:
@@ -2061,15 +2281,17 @@ def _choose_cut(
     for i in range(len(chars) - 1, -1, -1):
         suffix[i] = suffix[i + 1] + chars[i]
     pinned_cum = conv.pinned_component_chars(chars)
-    latest: int | None = None
+    best: int | None = None
+    best_reached = False
     for c in range(first, last + 1):
         if c not in conv.turn_start or not conv.pair_safe_boundary(c):
             continue
-        latest = c
         est = estimate_tokens(sys_chars + pinned_cum[c] + suffix[conv.turn_start[c]])
-        if est + cfg.notes_max_tokens <= cfg.low_water_tokens:
+        reached = est + cfg.notes_max_tokens <= cfg.low_water_tokens
+        best, best_reached = c, reached
+        if reached and not want_latest:
             return c, True
-    return latest, False
+    return best, best_reached
 
 
 def _assemble(
@@ -2157,6 +2379,8 @@ def finish_context(plan: ContextPlan, outcome: SummaryOutcome | None) -> Context
         out = _strip_pinned(fl, copy.deepcopy(plan.raw))
         idx: list[int | None] = list(range(len(out)))
         st = copy.copy(plan.input_state if plan.input_state is not None else plan.state)
+        report.cache_cold = plan.cache_cold
+        st.last_request_at = plan.now_epoch
         _track_cache(st, out, report)
         return ContextResult(_restore_shape(out, idx, plan.originals), st, report, {})
 
@@ -2242,7 +2466,14 @@ def finish_context(plan: ContextPlan, outcome: SummaryOutcome | None) -> Context
         built = _assemble(conv, masked, 0, None, cfg)
         reasons.append("pairing_guard")
 
+    for original, new, _kind in _apply_duplicates(
+        conv, masked, built.messages, built.origins, cfg.arrival == "lossless"
+    ):
+        report.arrival_compacted += 1
+        report.arrival_saved_chars += _clen(original) - _clen(new)
     out = _strip_pinned(fl, built.messages)
+    report.cache_cold = plan.cache_cold
+    st.last_request_at = plan.now_epoch
     report.notes_applied = built.notes_applied
     report.evicted_messages = built.evicted
     report.cut_turn = st.cut_turn if built.notes_applied else 0
@@ -2302,6 +2533,7 @@ def mask_observations(
     mask_style: str = "hide",
     keep_facts: bool = True,
     squeeze_recent_json: bool = False,
+    arrival: str = "off",
 ) -> tuple[list[Any], MaskReport]:
     """Layer 1: hide (or squeeze) old tool outputs behind a deterministic marker.
 
@@ -2334,6 +2566,7 @@ def mask_observations(
         mask_style=mask_style,
         keep_facts=keep_facts,
         squeeze_recent_json=squeeze_recent_json,
+        arrival=arrival,
     )
     plan = plan_context(
         messages,
@@ -2356,6 +2589,8 @@ def mask_observations(
         reasons=list(r.reasons),
         squeezed_outputs=r.squeezed_outputs,
         lossless_tables=r.lossless_tables,
+        arrival_compacted=r.arrival_compacted,
+        arrival_saved_chars=r.arrival_saved_chars,
     )
     return res.messages, report
 
@@ -2554,6 +2789,14 @@ class NotesKeeper:
             recent turns into lossless tables.
         cache_write_multiplier / cache_read_multiplier / expected_reuse: the
             prices (relative to plain input) behind ``clear_at_least_chars="auto"``.
+        arrival: ``"lossless"`` compacts every tool output without losing
+            anything (exact-duplicate references, lossless tables, collapsed
+            repeated lines) the same way on every request, so it never breaks
+            the prompt cache. Recommended. Default ``"off"``.
+        cache_ttl_seconds: the provider cache lifetime (default 300). After a
+            pause longer than this the cache is cold, so ctxfit moves the mask
+            boundary without a threshold and may cut notes from low water.
+            ``None`` turns this off. The time comes from ``clock``.
         summarizer_timeout_s: wall-clock limit per summariser call (default
             20 s; ``None`` calls it inline with no limit). The call runs on a
             shared pool of daemon threads; a late result is ignored.
@@ -2593,6 +2836,8 @@ class NotesKeeper:
         cache_write_multiplier: float = 1.25,
         cache_read_multiplier: float = 0.1,
         expected_reuse: float = 4,
+        arrival: str = "off",
+        cache_ttl_seconds: float | None = 300,
         summarizer_timeout_s: float | None = 20,
         offload: Callable[[str, str], None] | None = None,
         offload_max_bytes: int = 16 * 1024 * 1024,
@@ -2618,6 +2863,8 @@ class NotesKeeper:
             cache_write_multiplier=cache_write_multiplier,
             cache_read_multiplier=cache_read_multiplier,
             expected_reuse=expected_reuse,
+            arrival=arrival,
+            cache_ttl_seconds=cache_ttl_seconds,
         )
         if summarizer_timeout_s is not None and summarizer_timeout_s <= 0:
             raise ValueError("summarizer_timeout_s must be > 0")
@@ -2734,7 +2981,7 @@ class NotesKeeper:
             state=self._state,
             context_management=context_management,
             force=force,
-            now=self._clock().isoformat(),
+            now=self._clock(),
         )
         outcome = None
         if plan.summary is not None:

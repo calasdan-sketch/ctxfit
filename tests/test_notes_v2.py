@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -67,6 +68,9 @@ def _outcome(spec):
     )
 
 
+DEFAULT_NOW = "2026-11-05T00:00:00.000Z"
+
+
 def _run_step(data, step, state):
     plan = plan_context(
         step["input_messages"],
@@ -77,6 +81,7 @@ def _run_step(data, step, state):
         state=state,
         context_management=step.get("context_management"),
         force=step.get("force", False),
+        now=step.get("now", DEFAULT_NOW),
     )
     calls = []
     if plan.summary is not None:
@@ -88,7 +93,7 @@ def _run_step(data, step, state):
 @pytest.mark.parametrize("path", fixture_files("case"), ids=lambda p: p.stem)
 def test_fixture_case(path):
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["spec_version"] == 4 and data["generator"] == f"ctxfit {ctxfit.__version__}"
+    assert data["spec_version"] == 5 and data["generator"] == f"ctxfit {ctxfit.__version__}"
     notes = data["fake_notes_text"]
     step = {
         "input_messages": data["input_messages"],
@@ -112,7 +117,7 @@ def test_fixture_case(path):
 @pytest.mark.parametrize("path", fixture_files("scenario"), ids=lambda p: p.stem)
 def test_fixture_scenario(path):
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["spec_version"] == 4 and data["generator"] == f"ctxfit {ctxfit.__version__}"
+    assert data["spec_version"] == 5 and data["generator"] == f"ctxfit {ctxfit.__version__}"
     state = None
     for i, step in enumerate(data["steps"]):
         res, calls = _run_step(data, step, state)
@@ -154,9 +159,13 @@ def test_fixture_scenario_through_keeper(path):
             return sp["notes_text"]
 
     summ = Scripted()
-    k = NotesKeeper(summ, summarizer_timeout_s=None, **data["config"])
+    clock = [None]
+    k = NotesKeeper(
+        summ, summarizer_timeout_s=None, clock=lambda: clock[0], **data["config"]
+    )
     for i, step in enumerate(data["steps"]):
         summ.spec = step.get("summariser")
+        clock[0] = datetime.fromisoformat(step.get("now", DEFAULT_NOW).replace("Z", "+00:00"))
         out, r = k.fit(
             step["input_messages"],
             flavor=data["flavor"],
@@ -175,7 +184,7 @@ def test_fixture_scenario_through_keeper(path):
 @needs_fixtures
 def test_fixture_scrubber():
     data = json.loads((FIXTURES / "scrubber-01-patterns.json").read_text(encoding="utf-8"))
-    assert data["spec_version"] == 4
+    assert data["spec_version"] == 5
     for case in data["cases"]:
         assert scrub_secrets(case["input"]) == case["expected"]
 
@@ -202,7 +211,9 @@ def test_required_fixture_set_present():
 # pure core
 # ---------------------------------------------------------------------------
 
-CFG = NotesConfig(high_water_tokens=3000, low_water_tokens=1500, notes_max_tokens=100)
+CFG = NotesConfig(
+    high_water_tokens=3000, low_water_tokens=1500, notes_max_tokens=100, cache_ttl_seconds=None
+)
 
 
 def test_plan_and_finish_are_pure():

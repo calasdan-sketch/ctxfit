@@ -199,31 +199,57 @@ def all_facts(steps) -> set[str]:
     return facts
 
 
+NO_MASK = {"keep_recent_turns": 10_000}
+NOTES_LOW = {"high_water_tokens": 8_000, "low_water_tokens": 4_000}
+ARRIVAL = {"arrival": "lossless"}
+WARM_ONLY = {"cache_ttl_seconds": None}  # ignore cold-cache moments (v4 behaviour)
+
 STRATEGIES = {
     "none (baseline)": None,
+    "arrival lossless only (no masking)": ("mask", {**NO_MASK, **ARRIVAL}),
     "mask / hide": ("mask", {}),
-    "mask / squeeze": ("mask", {"mask_style": "squeeze"}),
-    "mask / hide, keep_facts off (v3)": ("mask", {"keep_facts": False}),
-    "mask / squeeze + recent JSON tables": (
-        "mask",
-        {"mask_style": "squeeze", "squeeze_recent_json": True},
-    ),
+    "mask / hide + arrival": ("mask", ARRIVAL),
     "mask / hide + clear_at_least 20k": ("mask", {"clear_at_least_chars": 20_000}),
-    "mask / hide + clear_at_least auto": ("mask", {"clear_at_least_chars": "auto"}),
+    "mask / hide + clear_at_least 20k, cold moments off": (
+        "mask",
+        {"clear_at_least_chars": 20_000, **WARM_ONLY},
+    ),
+    "mask / hide + clear_at_least 20k + arrival": (
+        "mask",
+        {"clear_at_least_chars": 20_000, **ARRIVAL},
+    ),
+    "mask / hide + clear_at_least auto + arrival": (
+        "mask",
+        {"clear_at_least_chars": "auto", **ARRIVAL},
+    ),
+    "mask / hide, keep_facts off": ("mask", {"keep_facts": False}),
+    "mask / squeeze": ("mask", {"mask_style": "squeeze"}),
     "notes, defaults (high water 60k)": ("notes", {}),
-    "notes, high water 8k / low 4k": (
-        "notes",
-        {"high_water_tokens": 8_000, "low_water_tokens": 4_000},
-    ),
-    "notes 8k/4k + squeeze": (
-        "notes",
-        {"high_water_tokens": 8_000, "low_water_tokens": 4_000, "mask_style": "squeeze"},
-    ),
+    "notes 8k/4k": ("notes", NOTES_LOW),
+    "notes 8k/4k, cold moments off": ("notes", {**NOTES_LOW, **WARM_ONLY}),
+    "notes 8k/4k + arrival": ("notes", {**NOTES_LOW, **ARRIVAL}),
 }
 
+CACHE_TTL = 300
 
-def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
+
+def timestamps(seed: int, n: int, pauses: bool = True) -> list[float]:
+    """Request times: mostly 10-60 s apart, with an occasional (12%) 6-20 minute pause."""
+    rng = random.Random(seed * 7919)
+    t, out = 0.0, []
+    for _ in range(n):
+        out.append(t)
+        pause = rng.random() < 0.12
+        gap = rng.uniform(360, 1200) if pause else rng.uniform(10, 60)
+        t += gap if pauses or not pause else rng.uniform(10, 60)
+    return out
+
+
+def run(
+    steps, task: str, strategy, base_cfg: dict[str, Any], seed: int = 0, pauses: bool = True
+) -> Totals:
     tot = Totals()
+    times = timestamps(seed, len(steps), pauses)
     state = None
     last_seen: dict[str, int] = {}  # call -> latest earlier turn with that exact call
     prev_boundary = 0  # previous request's applied mask boundary (turn t = step t here)
@@ -237,11 +263,13 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
             tot.rereads += 1
         msgs = to_messages(steps[: t + 1], task)
 
+        cold = t == 0 or times[t] - times[t - 1] > CACHE_TTL
+
         def price(out: list[dict[str, Any]]) -> float:
             nonlocal prev_out
             cur = [canonical_json(m) for m in out]
             k = 0
-            while k < min(len(cur), len(prev_out)) and cur[k] == prev_out[k]:
+            while not cold and k < min(len(cur), len(prev_out)) and cur[k] == prev_out[k]:
                 k += 1
             prev_out = cur
             cached = _estimate("anthropic", out[:k], 0)
@@ -263,7 +291,9 @@ def run(steps, task: str, strategy, base_cfg: dict[str, Any]) -> Totals:
             continue
         mode, extra = strategy
         cfg = NotesConfig(**{**base_cfg, **extra})
-        plan = plan_context(msgs, flavor="anthropic", mode=mode, config=cfg, state=state)
+        plan = plan_context(
+            msgs, flavor="anthropic", mode=mode, config=cfg, state=state, now=times[t]
+        )
         outcome = SummaryOutcome.ok(FAKE_NOTES) if plan.summary is not None else None
         res = finish_context(plan, outcome)
         state = res.state
@@ -325,7 +355,10 @@ def main() -> int:
         "carrying the full history so far, and state is carried between requests like a real "
         "agent loop. Default config (keep 4 turns, chunk 4, mask outputs >= 400 chars, notes "
         "high water 60k / low water 30k est. tokens). Token figures are ctxfit's chars/4 "
-        "estimate, summed over all requests of a run, not tokenizer counts.",
+        "estimate, summed over all requests of a run, not tokenizer counts. Requests get "
+        "simulated timestamps (seeded): mostly 10-60 s apart, with a 12% chance of a 6-20 "
+        "minute pause before a request; ctxfit is told the time, so its cold-cache rules "
+        "(`cache_ttl_seconds` 300) see the same pauses.",
         "",
         "- **sent** = estimated input tokens actually sent, summed over requests (baseline = no rewriting).",
         "- **net saved** = (baseline − sent − summariser in/out) / baseline.",
@@ -335,8 +368,12 @@ def main() -> int:
         "- **cache-priced cost** = input cost with Anthropic-style prompt caching, as a share "
         "of the baseline's cache-priced cost: per request, the leading messages identical to "
         "the previous request's are read from cache at 0.1x, the rest is written at 1.25x; "
-        "summariser input counts 1x and its output 5x. The baseline itself benefits from "
-        "caching here (every request extends the last), so this is the fair comparison.",
+        "summariser input counts 1x and its output 5x. After a pause longer than 300 s the "
+        "cache has expired: the whole request is written at 1.25x, for every strategy "
+        "including the baseline. The baseline itself benefits from caching (every request "
+        "extends the last), so this is the fair comparison. **same, no pauses** = the same "
+        "cost with every gap 10-60 s (the cache never expires), as a share of the baseline "
+        "under those conditions.",
         "- **facts visible** = share of the distinct fact tokens (paths, URLs, error codes, "
         "versions, ids; the same tokenizer ctxfit uses for `keeps:`) found anywhere in the "
         "tool outputs that still appear verbatim in the last request. A crude proxy for "
@@ -355,16 +392,20 @@ def main() -> int:
         lines += [
             f"## {corpus}",
             "",
-            "| strategy | sent (est. tokens) | net saved | cache-priced cost | summariser calls "
-            "| cache-stable | last request | facts visible | re-reads of hidden output |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| strategy | sent (est. tokens) | net saved | cache-priced cost | same, no pauses "
+            "| summariser calls | cache-stable | last request | facts visible "
+            "| re-reads of hidden output |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         base_sent = None
         base_cost = None
+        base_steady = None
         for name, strat in STRATEGIES.items():
             agg = Totals()
-            for steps, task in runs:
-                t = run(steps, task, strat, base_cfg)
+            steady = 0.0
+            for n, (steps, task) in enumerate(runs):
+                t = run(steps, task, strat, base_cfg, seed=n + 100 * len(steps))
+                steady += run(steps, task, strat, base_cfg, n + 100 * len(steps), False).cost
                 agg.requests += t.requests
                 agg.before += t.before
                 agg.after += t.after
@@ -379,12 +420,13 @@ def main() -> int:
                 agg.facts_total += t.facts_total
                 agg.facts_visible += t.facts_visible
             if base_sent is None:
-                base_sent, base_cost = agg.after, agg.cost
+                base_sent, base_cost, base_steady = agg.after, agg.cost, steady
             net = (base_sent - agg.after - agg.summariser) / base_sent
             stable = agg.stable / agg.comparable if agg.comparable else 0
             facts = agg.facts_visible / agg.facts_total if agg.facts_total else 0
             lines.append(
                 f"| {name} | {agg.after:,} | {net:.1%} | {agg.cost / base_cost:.0%} "
+                f"| {steady / base_steady:.0%} "
                 f"| {agg.summariser_calls} | {stable:.0%} | {agg.last_after // len(runs):,} "
                 f"| {facts:.0%} | {agg.rereads_hidden} of {agg.rereads} |"
             )
@@ -392,33 +434,29 @@ def main() -> int:
     lines += [
         "## Reading this honestly",
         "",
-        "- Savings depend almost entirely on how much of the history is old tool output. "
-        "These synthetic transcripts are tool-heavy on purpose; chat-heavy conversations "
-        "save far less.",
-        "- `cache-stable` below 100% means some requests rewrite earlier content and pay a "
-        "fresh cache write; the chunked boundary keeps those moves rare, `clear_at_least_chars` "
-        "makes them rarer.",
-        "- With the default high water (60k est. tokens) notes never engage on these "
-        "transcripts: masking alone keeps every request under it. The 8k/4k rows lower the "
-        "marks only to show the notes mechanics at this scale; each summariser call costs "
-        "its input (the evicted turns) and that cost is subtracted in `net saved`.",
-        "- Priced with prompt caching, the picture is much less rosy than raw tokens: the "
-        "baseline already reads most of each request from cache at 0.1x, while every "
-        "boundary move rewrites the prefix and pays 1.25x on it again. Hide masking comes "
-        "out 2-8% cheaper and `clear_at_least_chars` 20k 7-19% cheaper; squeeze (bigger "
-        "digests rewritten each move) can cost more than the baseline, and notes at these "
-        "low thresholds come out MORE expensive than "
-        "doing nothing (summariser spend plus extra cache writes). Use notes for context "
-        "limits, not to save money on cached Claude traffic.",
-        "- `clear_at_least_chars: auto` behaves like the default here: with Anthropic's "
-        "prices and 4 expected reuses it only holds moves that hide less than about a third "
-        "of the prefix, and these transcripts' moves are bigger than that.",
-        "- `keeps:` facts on the markers cost a few percent of the savings and keep far more "
-        "specifics visible (compare the keep_facts off row).",
-        "- The JSON API rows in these transcripts have a list field (`tags`), so they are "
-        "not flat and never become lossless tables; the tables row equals plain squeeze here.",
-        "- Squeeze keeps more of each output (head/tail, error lines, JSON shape) so it saves "
-        "less than hide; whether that avoids re-reads is not something a replay can show.",
+        "- **What saves real money with caching:** lossless arrival compaction. It changes "
+        "each output once, when it first arrives (before anything is cached), so every "
+        "request still extends the last one (cache-stable 100%) and every fact stays "
+        "visible. Here it cost 77-79% (coding) and 52-53% (research) of the baseline. Most "
+        "of that is exact duplicates: these agents re-read the same files and pages, which "
+        "real agents do too, but your mileage depends on how often yours does.",
+        "- **Masking pays mostly through pauses.** With pauses, hide masking cost 65-76%; "
+        "with the cache always warm, 92-98% (each boundary move rewrites the prefix at "
+        "1.25x, which eats most of what it saves). Adding arrival and `clear_at_least_chars` "
+        "20k is the cheapest setup here: 51-57% with pauses, 73-74% without.",
+        "- **Cold-cache moments help a little.** Moving held-back boundaries during a pause "
+        "(free, the cache is gone anyway) lowered `clear_at_least_chars` 20k from 64% to 56% "
+        "(coding) and 74% to 72% (research). With `clear_at_least_chars` 0 it changes "
+        "nothing, since every move already happens.",
+        "- **Notes cost money.** At these low thresholds notes cost 75-93% with pauses and "
+        "116-138% without: more than doing nothing. With the default high water (60k) they "
+        "never engaged. Use notes to stay under a context limit, not to save money.",
+        "- **Squeeze** keeps more of each output, so it saves less and, with a warm cache, "
+        "can cost more than the baseline (116% on research).",
+        "- `keeps:` facts cost 1-2 points and keep far more specifics visible; "
+        "`clear_at_least_chars: auto` behaves like 0 here (these moves are big enough).",
+        "- The coding transcripts' JSON rows have a list field, so they never become tables; "
+        "the research corpus has no tables either. Tables are not what drives these numbers.",
         "- Nothing here measures answer quality. JetBrains Research (Dec 2025) is the evidence "
         "we rely on for quality; this script only checks the mechanics.",
         "",

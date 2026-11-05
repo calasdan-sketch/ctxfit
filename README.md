@@ -153,11 +153,35 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
-## Running notes (opt-in, 0.5.0)
+## Running notes (opt-in, 0.6.0)
 
 Long agent runs re-send the whole conversation every turn. Most of that is old
-tool output nobody will read again. `ctxfit.notes` cuts it in two layers, both
-off unless you call them:
+tool output nobody will read again. `ctxfit.notes` cuts it down, all of it off
+unless you call it.
+
+**What saves real money if your provider caches prompts** (Claude, OpenAI):
+a cached prefix is already 10x cheaper, and rewriting old history makes you
+pay to cache it again. So, in order:
+
+1. **`arrival="lossless"`** — compacts each tool output once, when it first
+   arrives, without losing anything: a repeat of an output the model can
+   still see becomes `[ctxfit: identical to earlier output id 3f9a1c07]`, flat
+   JSON arrays become tables, runs of identical lines become `line  [x12]`.
+   The same output always gets the same form, so the prompt cache is never
+   broken. In our synthetic benchmark this alone cost 52-79% of doing nothing,
+   with every fact still visible (most of it from repeated file and page
+   reads; your agent may repeat less).
+2. **Masking with `clear_at_least_chars`** (e.g. 20,000) — hides old outputs
+   only in big steps, and **during pauses**: after `cache_ttl_seconds` (300)
+   without a request the cache has expired anyway, so ctxfit takes that
+   moment to catch up. With arrival on: 51-57% of baseline cost with
+   realistic pauses, 73-74% when the cache never goes cold.
+3. **Running notes** — only to stay under a context limit. They cost more
+   than they save on cached traffic (summariser calls plus re-caching).
+
+`benchmarks/RESULTS.md` has the numbers and the method (synthetic transcripts).
+
+The two layers:
 
 1. **Observation masking** — no model call. Old tool outputs (≥ 400 chars,
    older than the last 4 turns) become one line:
@@ -243,6 +267,19 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
   worth the cache write it causes, from cache prices
   (`cache_write_multiplier=1.25`, `cache_read_multiplier=0.1`) and how many
   more requests you expect to reuse the prefix (`expected_reuse=4`).
+
+**Changed in 0.6.0** (state from 0.5.0 is discarded once, `spec_changed`):
+
+- `arrival="lossless"` (see above; off by default, recommended).
+- **Cold-cache moments.** ctxfit remembers when the last request went out
+  (`clock=` on the keeper, `now=` on `plan_context`). After more than
+  `cache_ttl_seconds` (default 300; `None` turns this off), boundary moves
+  happen regardless of `clear_at_least_chars`, and running notes cut from the
+  low-water mark, as far back as allowed — rewriting is free then. Note this
+  also applies to the first request of a conversation: if it is already over
+  low water, the keeper cuts right away.
+- Fix: an HTTP status code next to `HTTP`/`status` was counted from the wrong
+  position (now matches the TypeScript port).
 
 **No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
 the summariser call yourself (async, a queue, another process), use the pure
@@ -371,10 +408,10 @@ If you are on Claude only and want zero code, context editing is simpler. If
 you need a summary that a human can read, can audit or that works across
 providers, or a record you can recall from, that is where ctxfit fits.
 One honest caveat from our own benchmark: priced with Claude prompt caching,
-masking saves far less money than tokens (the untouched baseline is mostly
-cache reads), squeeze can cost more than doing nothing, and running notes
-cost more — they are for staying under the context limit, not for saving
-money on cached traffic.
+masking saves far less money than tokens while the cache stays warm (92-98%
+of baseline cost), squeeze can cost more than doing nothing, and running notes
+cost more — they are for staying under the context limit. Lossless arrival
+compaction and pause-time catch-up are where the money is.
 Savings claims of other projects are their own; ours, on synthetic
 transcripts only, are in `benchmarks/RESULTS.md` (method stated there).
 

@@ -23,7 +23,7 @@ from ctxfit.notes import (
 
 
 def test_algo_is_rn3_and_old_states_are_spec_changed():
-    assert ALGO == "rn-4"
+    assert ALGO == "rn-5"
     plan = plan_context(anthropic_convo(4), state={"version": 2, "algo": "rn-2"})
     assert "spec_changed" in plan.reasons
 
@@ -49,6 +49,7 @@ def test_exclude_tools_never_masked_or_squeezed():
 
 
 def _mask_step(msgs, state, **cfg):
+    cfg = {"cache_ttl_seconds": None, **cfg}
     plan = plan_context(msgs, mode="mask", config=NotesConfig(**cfg), state=state)
     res = finish_context(plan, None)
     return res.report, res.state
