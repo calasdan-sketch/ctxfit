@@ -26,7 +26,6 @@ How a transcript becomes requests:
 
 from __future__ import annotations
 
-import glob
 import json
 import math
 import os
@@ -42,7 +41,10 @@ from .notes import (
     _clean_fact,
     _content_text,
     _estimate,
+    _js_int,
+    _json_depth_ok,
     _raw_fact_tokens,
+    _reject_constant,
     _sha256,
     canonical_json,
     finish_context,
@@ -156,24 +158,89 @@ def default_paths() -> list[str]:
     return [os.path.join(os.path.expanduser("~"), ".claude", "projects", "**", "*.jsonl")]
 
 
+_WILD = re.compile(r"[*?]")
+
+
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """``**/`` = any number of directories, ``*`` = any characters but ``/``, ``?`` = one
+    such character; everything else literal (no ``[...]`` classes)."""
+    out = ""
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out += "(?:[^/]+/)*"
+            i += 3
+        elif pattern.startswith("**", i):
+            out += ".*"
+            i += 2
+        elif pattern[i] == "*":
+            out += "[^/]*"
+            i += 1
+        elif pattern[i] == "?":
+            out += "[^/]"
+            i += 1
+        else:
+            out += re.escape(pattern[i])
+            i += 1
+    return re.compile(out, re.DOTALL)
+
+
+def _walk_files(root: str) -> list[str]:
+    """Every file under ``root``, never following a symlinked directory (no loops)."""
+    found: list[str] = []
+    for dirpath, _dirs, files in os.walk(root, followlinks=False):
+        for f in files:
+            full = os.path.join(dirpath, f)
+            if os.path.isfile(full):
+                found.append(full)
+    return found
+
+
 def expand_paths(paths: Sequence[str]) -> list[str]:
-    """Files from paths, directories (searched for ``*.jsonl``) and globs; sorted, unique."""
+    """Files from paths, directories (every ``*.jsonl`` below) and ``*``/``**``/``?`` patterns.
+
+    Symlinked directories are never followed; files are deduplicated by their
+    real path (the first in sorted order is kept). Sorted by path.
+    """
     out: set[str] = set()
-    for p in paths:
-        if os.path.isdir(p):
-            out.update(glob.glob(os.path.join(p, "**", "*.jsonl"), recursive=True))
-        elif any(c in p for c in "*?["):
-            out.update(glob.glob(os.path.expanduser(p), recursive=True))
+    for raw in paths:
+        p = os.path.expanduser(raw)
+        if _WILD.search(p):
+            parts = p.replace(os.sep, "/").split("/")
+            fixed = []
+            for part in parts:
+                if _WILD.search(part):
+                    break
+                fixed.append(part)
+            base = "/".join(fixed) or "."
+            if not os.path.isdir(base):
+                continue
+            rx = _glob_regex(p.replace(os.sep, "/"))
+            out.update(f for f in _walk_files(base) if rx.fullmatch(f.replace(os.sep, "/")))
+        elif os.path.isdir(p):
+            out.update(f for f in _walk_files(p) if f.endswith(".jsonl"))
         elif os.path.isfile(p):
             out.add(p)
-    return sorted(out)
+    unique: dict[str, str] = {}
+    for f in sorted(out):
+        unique.setdefault(os.path.realpath(f), f)
+    return sorted(unique.values())
 
 
 def _usage(u: Any) -> dict[str, int]:
     u = u if isinstance(u, dict) else {}
 
     def n(v: Any) -> int:
-        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+        # JSON integers (an integral float like 3.0 counts: JSON.parse cannot tell them
+        # apart); above 2^53 through the double, as JavaScript reads it.
+        if isinstance(v, bool) or not isinstance(v, int | float):
+            return 0
+        if isinstance(v, float) and not (math.isfinite(v) and v.is_integer()):
+            return 0
+        v = int(v)
+        if v < 0:
+            return 0
+        return int(float(v)) if v > 2**53 else v
 
     write = n(u.get("cache_creation_input_tokens"))
     cc = u.get("cache_creation")
@@ -193,7 +260,18 @@ def _blocks(content: Any) -> list[Any]:
         return list(content)
     if content is None or content == "":
         return []
-    return [{"type": "text", "text": content if isinstance(content, str) else str(content)}]
+    return [{"type": "text", "text": content if isinstance(content, str) else canonical_json(content)}]
+
+
+_BLANK_LINE = re.compile(r"[ \t\n\r\f\v]*")
+MAX_LINE_DEPTH = 200
+
+
+def _session(v: Any) -> str:
+    """A sessionId as text: a string as is, missing/null as "", anything else canonical JSON."""
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else canonical_json(v)
 
 
 def _ts(entry: dict[str, Any]) -> int | None:
@@ -212,27 +290,33 @@ def load_corpus(paths: Sequence[str]) -> Corpus:
     corpus.files = len(files)
     entries: list[dict[str, Any]] = []
     for path in files:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if not line.strip():
-                    continue
-                try:
-                    e = json.loads(line)
-                except ValueError:
-                    corpus.skipped_lines += 1
-                    continue
-                if not isinstance(e, dict):
-                    corpus.skipped_lines += 1
-                    continue
-                corpus.entries += 1
-                if not isinstance(e.get("uuid"), str):
-                    continue  # summaries, snapshots: no place in a chain
-                if e.get("type") in ("user", "assistant") and (
-                    _ts(e) is None or not isinstance(e.get("message"), dict)
-                ):
-                    corpus.skipped_lines += 1
-                    continue
-                entries.append(e)  # other entry types still link the chain
+        with open(path, "rb") as fh:
+            data = fh.read().decode("utf-8", errors="replace")
+        for line in data.split("\n"):
+            if _BLANK_LINE.fullmatch(line):
+                continue
+            # A line nested deeper than 200 levels is skipped before parsing (keeps every
+            # later step within the stack on both sides); NaN/Infinity are not JSON.
+            if not _json_depth_ok(line, MAX_LINE_DEPTH):
+                corpus.skipped_lines += 1
+                continue
+            try:
+                e = json.loads(line, parse_constant=_reject_constant)
+            except (ValueError, RecursionError):
+                corpus.skipped_lines += 1
+                continue
+            if not isinstance(e, dict):
+                corpus.skipped_lines += 1
+                continue
+            corpus.entries += 1
+            if not isinstance(e.get("uuid"), str):
+                continue  # summaries, snapshots: no place in a chain
+            if e.get("type") in ("user", "assistant") and (
+                _ts(e) is None or not isinstance(e.get("message"), dict)
+            ):
+                corpus.skipped_lines += 1
+                continue
+            entries.append(e)  # other entry types still link the chain
     by_uuid: dict[str, dict[str, Any]] = {}
     for e in entries:
         by_uuid.setdefault(e["uuid"], e)
@@ -262,7 +346,7 @@ def load_corpus(paths: Sequence[str]) -> Corpus:
         corpus.requests.append(
             Request(
                 conversation=root,
-                session=str(head.get("sessionId") or ""),
+                session=_session(head.get("sessionId")),
                 ts_ms=_ts(head) or 0,
                 message_id=mid,
                 model=model if isinstance(model, str) else "",
@@ -599,8 +683,27 @@ def replay(
 
 
 def dumps(report: dict[str, Any]) -> str:
-    """The exact bytes of ``ctxfit replay --json``: 2-space JSON, UTF-8, trailing newline."""
-    return json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    """The exact bytes of ``ctxfit replay --json``: 2-space JSON, UTF-8, trailing newline.
+
+    Integers beyond 2^53 are printed as JavaScript prints the double they become
+    (``JSON.stringify``), so both implementations write the same digits.
+    """
+    big: list[str] = []
+
+    def mark(v: Any) -> Any:
+        if isinstance(v, dict):
+            return {k: mark(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [mark(x) for x in v]
+        if isinstance(v, int) and not isinstance(v, bool) and abs(v) > 2**53:
+            big.append(_js_int(v))
+            return f"\x00jsnum{len(big) - 1}\x00"
+        return v
+
+    text = json.dumps(mark(report), indent=2, ensure_ascii=False)
+    for i, digits in enumerate(big):
+        text = text.replace(f'"\\u0000jsnum{i}\\u0000"', digits)
+    return text + "\n"
 
 
 def summary(report: dict[str, Any]) -> str:

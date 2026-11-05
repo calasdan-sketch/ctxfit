@@ -346,3 +346,138 @@ def test_copy_of_demo_still_replays(tmp_path):
     for p in DEMO_DIR.glob("*.jsonl"):
         shutil.copy(p, tmp_path / p.name)
     assert replay([str(tmp_path)], redact=True) == replay([str(DEMO_DIR)], redact=True)
+
+
+# -- panel review of rn-6 ----------------------------------------------------------
+
+
+@needs_fixtures
+def test_replay_odd_input_fixture():
+    want = (FIXTURES / "replay-03-odd.json").read_text(encoding="utf-8")
+    assert dumps(replay([str(FIXTURES / "replay-odd")], prices=_prices())) == want
+    rep = json.loads(want)
+    assert rep["corpus"]["skipped_lines"] == 4 and rep["corpus"]["requests"] == 3
+
+
+def test_replay_never_follows_directory_symlinks(tmp_path):
+    from ctxfit.replay import expand_paths
+
+    (tmp_path / "d").mkdir()
+    shutil.copy(next(DEMO_DIR.glob("*.jsonl")), tmp_path / "d" / "a.jsonl")
+    (tmp_path / "d" / "loop").symlink_to(tmp_path / "d", target_is_directory=True)
+    (tmp_path / "d" / "same.jsonl").symlink_to(tmp_path / "d" / "a.jsonl")
+    assert len(expand_paths([str(tmp_path)])) == 1
+    assert len(expand_paths([str(tmp_path / "**" / "*.jsonl")])) == 1
+    assert expand_paths([str(tmp_path / "d" / "?.jsonl")]) == [str(tmp_path / "d" / "a.jsonl")]
+    assert expand_paths([str(tmp_path / "nope" / "*.jsonl")]) == []
+
+
+def test_replay_line_rules(tmp_path):
+    deep = "[" * 300 + "]" * 300
+    good = next(DEMO_DIR.glob("session-b.jsonl")).read_text(encoding="utf-8").split("\n")[0]
+    (tmp_path / "x.jsonl").write_text(
+        "\n".join([deep, '{"a": NaN}', " \t", " ", good, "[1]"]) + "\n", encoding="utf-8"
+    )
+    c = load_corpus([str(tmp_path)])
+    assert c.skipped_lines == 4 and c.entries == 1
+
+
+def test_replay_usage_numbers():
+    from ctxfit.replay import _usage
+
+    u = _usage({"input_tokens": 3.0, "cache_read_input_tokens": 2.5, "output_tokens": True,
+                "cache_creation_input_tokens": 2**53 + 3})  # fmt: skip
+    assert u == {"input": 3, "read": 0, "write5": 2**53 + 4, "write1h": 0, "output": 0}
+
+
+def test_badge_refuses_other_corpora_and_rounds(tmp_path):
+    from ctxfit.proof import badge_message
+
+    (tmp_path / "x.jsonl").write_text("{}\n")
+    with pytest.raises(ValueError):
+        badge(str(tmp_path))
+    for p in DEMO_DIR.glob("*.jsonl"):
+        shutil.copy(p, tmp_path / p.name)
+    (tmp_path / "x.jsonl").unlink()
+    assert badge(str(tmp_path)) == badge()
+    assert badge_message(8635, "s") == ("-13.6% (s)", "brightgreen")  # -136.5 -> -136
+    assert badge_message(8634, "s")[0] == "-13.7% (s)"
+    assert badge_message(10000, "s") == ("+0.0% (s)", "orange")
+    assert badge_message(9995, "s") == ("+0.0% (s)", "orange")  # -0.5 tenths -> 0
+    assert badge_message(9994, "s") == ("-0.1% (s)", "green")
+
+
+def test_eval_max_usd_must_be_finite_positive():
+    for bad in (0, -1, float("inf"), float("nan")):
+        with pytest.raises(EvalBudgetError):
+            run_eval([str(DEMO_DIR)], lambda calls: {}, max_usd=bad)
+
+
+def test_eval_sends_plain_text_only():
+    from ctxfit.evaluate import flatten
+
+    msgs = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t", "signature": "sig"},
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {"p": 1}},
+            ],
+        },  # fmt: skip
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "a",
+                    "content": "key sk-ant-api03-AAAABBBBCCCCDDDDEEEE",
+                },
+                {"type": "image", "source": {}},
+            ],
+        },  # fmt: skip
+        {"role": "user", "content": "more"},
+    ]
+    out = flatten(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    blob = json.dumps(out)
+    assert "thinking" not in blob and "signature" not in blob and "tool_use" not in blob
+    assert "[tool call Read]" in blob and "[non-text]" in blob and "AAAABBBB" not in blob
+    assert all(b["type"] == "text" for m in out for b in m["content"])
+
+
+def test_eval_batch_errors_are_errors():
+    from ctxfit.evaluate import Call
+
+    def create(requests):
+        return SimpleNamespace(id="b", processing_status="ended", requests=requests)
+
+    def results(bid):
+        yield SimpleNamespace(custom_id="p0", result=SimpleNamespace(type="errored"))
+
+    client = SimpleNamespace(messages=SimpleNamespace(batches=SimpleNamespace(
+        create=create, retrieve=lambda b: None, results=results)))  # fmt: skip
+    run = anthropic_backend(client, "m", batch=True)
+    with pytest.raises(RuntimeError):
+        run([Call("k", [{"role": "user", "content": "q"}], 8, 2)])
+
+
+def test_eval_cli_warns_about_sending_content(capsys):
+    main(["eval", str(DEMO_DIR)])
+    assert "sends transcript content" in capsys.readouterr().err
+
+
+def test_responses_any_call_id_item_pairs():
+    items = [
+        {"role": "user", "content": "task"},
+        {
+            "type": "local_shell_call",
+            "call_id": "ls1",
+            "action": {"type": "exec", "command": ["ls"]},
+        },
+        {"type": "message", "role": "user", "content": "next"},
+        {"type": "local_shell_call_output", "call_id": "ls1", "output": "x" * 500},
+        {"type": "message", "role": "user", "content": "next 2"},
+    ]
+    plan = plan_context(items, mode="mask", config=NotesConfig(cache_ttl_seconds=None))
+    assert not plan.conv.pair_safe_boundary(1) and plan.conv.pair_safe_boundary(2)
+    assert finish_context(plan, None).messages == items  # passed through untouched

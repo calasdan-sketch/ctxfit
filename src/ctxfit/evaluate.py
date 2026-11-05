@@ -16,7 +16,6 @@ through the Message Batches API (half price, slower).
 
 from __future__ import annotations
 
-import copy
 import json
 import math
 import re
@@ -30,6 +29,7 @@ from .notes import (
     _content_text,
     _Conversation,
     _estimate,
+    canonical_json,
     estimate_tokens,
     extract_facts,
     finish_context,
@@ -82,9 +82,63 @@ Backend = Callable[[list[Call]], dict[str, tuple[str, int, int]]]
 """calls -> {key: (text, input_tokens, output_tokens)}"""
 
 
+PRIVACY_WARNING = (
+    "ctxfit eval sends transcript content (tool outputs, file contents, your prompts; secrets "
+    "are scrubbed by pattern, not guaranteed) to the model provider. Use it only on "
+    "transcripts you are allowed to share with them."
+)
+
+
+def _flatten_block(b: Any) -> str | None:
+    """One content block as plain text; thinking blocks are dropped (never resent)."""
+    if isinstance(b, str):
+        return b
+    if not isinstance(b, dict):
+        return None
+    t = b.get("type")
+    if t == "text":
+        return str(b.get("text", ""))
+    if t == "tool_use":
+        return f"[tool call {b.get('name') or 'tool'}] {canonical_json(b.get('input', {}))}"
+    if t == "tool_result":
+        return "[tool result]\n" + _content_text(b.get("content"))
+    if t in ("thinking", "redacted_thinking"):
+        return None
+    return "[non-text]"
+
+
+def flatten(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A transcript context as plain user/assistant text turns the API accepts.
+
+    tool_use / tool_result become text (no tool definitions are needed),
+    thinking and redacted_thinking blocks are dropped (signed thinking is
+    never resent), other blocks become ``[non-text]``. Consecutive turns of
+    one role are merged, the first turn is a user turn, and all text is passed
+    through the secret scrubber.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        content = m.get("content")
+        parts = [content] if isinstance(content, str) else list(content or [])
+        texts = [x for x in (_flatten_block(b) for b in parts) if x]
+        if not texts:
+            continue
+        text = scrub_secrets("\n".join(texts))
+        if out and out[-1]["role"] == role:
+            out[-1]["content"][0]["text"] += "\n\n" + text
+        else:
+            out.append({"role": role, "content": [{"type": "text", "text": text}]})
+    if not out or out[0]["role"] != "user":
+        out.insert(
+            0, {"role": "user", "content": [{"type": "text", "text": "(conversation start)"}]}
+        )
+    return out
+
+
 def _ask(messages: Sequence[dict[str, Any]], question: str) -> list[dict[str, Any]]:
-    """The context with ``question`` added to the final user turn (alternation stays valid)."""
-    msgs = copy.deepcopy(list(messages))
+    """The flattened context with ``question`` added to the final user turn."""
+    msgs = flatten(messages)
     block = {"type": "text", "text": question}
     if msgs and msgs[-1].get("role") == "user":
         content = msgs[-1].get("content")
@@ -242,6 +296,11 @@ def run_eval(
     """Build the probes, check the budget, make the calls, score them."""
     if checkpoints < 1:
         raise ValueError("checkpoints must be >= 1")
+    if max_usd is not None and (
+        isinstance(max_usd, bool) or not isinstance(max_usd, int | float)
+        or not math.isfinite(max_usd) or max_usd <= 0
+    ):  # fmt: skip
+        raise EvalBudgetError("--max-usd must be a finite number above 0")
     table = prices if prices is not None else load_prices()
     requests = load_corpus(list(paths)).requests
     plan = build_plan(requests, strategy, checkpoints, judge)
@@ -357,12 +416,14 @@ def anthropic_backend(
         for item in client.messages.batches.results(_get(job, "id")):
             result = _get(item, "result")
             key = ids[_get(item, "custom_id")]
-            if _get(result, "type") == "succeeded":
-                out[key] = _reply(_get(result, "message"))
-            else:
-                out[key] = ("", 0, 0)
-        for key in ids.values():
-            out.setdefault(key, ("", 0, 0))
+            if _get(result, "type") != "succeeded":
+                raise RuntimeError(
+                    f"batch item {_get(item, 'custom_id')} did not succeed: {_get(result, 'type')}"
+                )
+            out[key] = _reply(_get(result, "message"))
+        missing = [k for k in ids.values() if k not in out]
+        if missing:
+            raise RuntimeError(f"batch returned no result for {len(missing)} request(s)")
         return out
 
     return batched if batch else direct

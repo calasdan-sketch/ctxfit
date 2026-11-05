@@ -272,7 +272,8 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
 
 - **Check it on your own history first: `ctxfit replay`.** Reads Claude
   Code's local transcripts (`~/.claude/projects/**/*.jsonl`, or paths you
-  give, `--since 2026-11-01`), rebuilds every request, prices what was
+  give, `--since 2026-11-01`; symlinked folders are never followed),
+  rebuilds every request, prices what was
   really recorded, and shows what each strategy would have cost with prompt
   caching, how often a hidden output was fetched again, and whether any
   file read was altered. Nothing leaves your machine; `--redact` prints
@@ -297,8 +298,13 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
   (`--judge` adds open recall/artifact/next-step/decision questions graded
   by the model). It prints an estimated price first and will not run
   without `--max-usd`; `--batch` uses the Message Batches API at half price.
+  **It sends transcript content to the model provider** (tool outputs, file
+  contents, prompts; secrets are scrubbed by pattern, which is not a
+  guarantee) and says so every time. Contexts are sent as plain text turns:
+  tool calls and results become text, thinking blocks are dropped.
 - **Proof kit**: `ctxfit badge --out savings.json` (a shields.io endpoint
-  computed only from the bundled synthetic demo corpus), `scripts/demo.tape`
+  computed only from the bundled synthetic demo corpus; any other corpus is
+  refused), `scripts/demo.tape`
   (vhs recording of a replay; the GIF is built in CI, not committed), and a
   CI job that fails when `benchmarks/RESULTS.md` or `docs/demo-replay.json`
   no longer match the code.

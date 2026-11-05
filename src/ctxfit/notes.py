@@ -647,6 +647,15 @@ def _view_responses(i: int, m: dict[str, Any]) -> _View:
     # passed through byte for byte. Never masked; pinned (never evicted) except a
     # reasoning item, which goes with the item right after it.
     role = itype if isinstance(itype, str) else "item"
+    cid = _id(m.get("call_id"))
+    if cid is not None:
+        # Any other item with a call_id (local_shell_call, computer_call, mcp tool calls, an
+        # encrypted function_call, ... and their *_output) still pairs by call_id.
+        if role.endswith("_output"):
+            return _View(i, role, False, "", [], [(cid, _responses_output_text(m))], fixed=True)
+        name = m.get("name")
+        call = (cid, name if isinstance(name, str) and name else role, "")
+        return _View(i, role, False, "", [call], [], fixed=True, raw_args=[("", True)])
     return _View(i, role, False, "", [], [], fixed=True)
 
 
@@ -714,8 +723,10 @@ class _Conversation:
                 elif flavor == "openai":
                     if owner is not None:
                         self._pair(owner, v.index)
+                        self._positional_name(owner, v.index, rpos)
                 elif v.index >= 1:
                     self._pair(v.index - 1, v.index)
+                    self._positional_name(v.index - 1, v.index, rpos)
             if is_tool_msg and owner is not None:
                 run_of.setdefault(owner, []).append(v.index)
             for cpos, (cid, _name, _args) in enumerate(v.calls):
@@ -748,6 +759,12 @@ class _Conversation:
         for d in diff:
             acc += d
             self._unsafe.append(acc)
+
+    def _positional_name(self, call_idx: int, result_idx: int, rpos: int) -> None:
+        """Spec v6 panel: an id-less result takes the name of its positional partner's only call."""
+        calls = self.views[call_idx].calls
+        if len(calls) == 1:
+            self.result_tool[(result_idx, rpos)] = calls[0][1]
 
     def _pair(self, a: int, b: int) -> None:
         if a != b:

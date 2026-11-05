@@ -143,8 +143,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
-    from .evaluate import EvalBudgetError, anthropic_backend, dumps, run_eval
+    from .evaluate import PRIVACY_WARNING, EvalBudgetError, anthropic_backend, dumps, run_eval
     from .replay import default_paths
+
+    print(f"warning: {PRIVACY_WARNING}", file=sys.stderr)
 
     def show(usd: float) -> None:
         print(f"estimated cost: ${usd:.4f} ({args.model}{', batch' if args.batch else ''})")
