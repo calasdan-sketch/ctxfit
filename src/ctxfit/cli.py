@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -110,8 +111,16 @@ def cmd_mask(args: argparse.Namespace) -> int:
             json.dump(masked, fh, indent=2, ensure_ascii=False)
         print(f"wrote {args.out}")
     if args.report:
-        with open(args.report, "w", encoding="utf-8") as fh:
-            json.dump(report.to_dict(include_offload=args.offload), fh, indent=2)
+        data = report.to_dict(include_offload=args.offload)
+        if args.offload:
+            # The report then holds the original tool outputs: owner-only.
+            fd = os.open(args.report, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.chmod(args.report, 0o600)
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+        else:
+            fh = open(args.report, "w", encoding="utf-8")
+        with fh:
+            json.dump(data, fh, indent=2)
         print(f"wrote {args.report}")
     print(report.summary())
     return 0
@@ -184,7 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
     mk.add_argument("--out", default=None, help="write masked messages here (JSON)")
     mk.add_argument("--report", default=None, help="write MaskReport JSON here")
     mk.add_argument(
-        "--offload", action="store_true", help="include original outputs (id8 -> text) in report"
+        "--offload",
+        action="store_true",
+        help="include original outputs (id8 -> text) in the report (written with mode 0600)",
     )
     mk.set_defaults(func=cmd_mask)
 

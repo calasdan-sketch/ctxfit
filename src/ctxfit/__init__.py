@@ -13,11 +13,18 @@ from .estimate import HeuristicEstimator, TiktokenEstimator, TokenEstimator, get
 from .messages import Message, normalize, validate_pairing
 from .notes import (
     MaskReport,
+    NotesConfig,
     NotesKeeper,
     NotesReport,
+    NotesState,
+    SummaryOutcome,
+    SummaryRequest,
+    SummaryTruncated,
     anthropic_summarizer,
+    finish_context,
     mask_observations,
     openai_summarizer,
+    plan_context,
     scrub_secrets,
 )
 from .pipeline import FitPipeline, FitReport, PairingBroken, fit
@@ -32,7 +39,7 @@ from .strategies import (
     TruncateToolOutput,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Budget",
@@ -46,24 +53,31 @@ __all__ = [
     "HeuristicEstimator",
     "MaskReport",
     "Message",
+    "NotesConfig",
     "NotesKeeper",
     "NotesReport",
+    "NotesState",
     "OverflowWarning",
     "PairingBroken",
     "SlidingWindow",
     "Strategy",
     "StrategyContext",
     "StrategyReport",
+    "SummaryOutcome",
+    "SummaryRequest",
+    "SummaryTruncated",
     "TiktokenEstimator",
     "TokenEstimator",
     "TruncateToolOutput",
     "__version__",
     "anthropic_summarizer",
+    "finish_context",
     "fit",
     "get_estimator",
     "mask_observations",
     "normalize",
     "openai_summarizer",
+    "plan_context",
     "scrub_secrets",
     "validate_pairing",
 ]

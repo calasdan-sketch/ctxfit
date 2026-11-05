@@ -153,7 +153,7 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
-## Running notes (opt-in, 0.2.0)
+## Running notes (opt-in, 0.3.0)
 
 Long agent runs re-send the whole conversation every turn. Most of that is old
 tool output nobody will read again. `ctxfit.notes` cuts it in two layers, both
@@ -181,7 +181,8 @@ print(report.summary())
 
 # Both layers: keep one NotesKeeper per conversation
 keeper = NotesKeeper(anthropic_summarizer(anthropic.Anthropic()))  # model="claude-haiku-5-5"
-fitted, report = keeper.fit(body["messages"], system=body.get("system"))
+fitted, report = keeper.fit(body["messages"], system=body.get("system"),
+                            context_management=body.get("context_management"))
 print(report.summary())   # example output:
 # est. tokens: 71,300 → 24,900 (−65.1%) [chars/4]
 #   masked 9 tool output(s), 96,420 chars (boundary turn 20 of 26)
@@ -196,8 +197,26 @@ Always pass the **full original history** to `keeper.fit()`; it re-applies
 the same cut every time. `openai_summarizer(client, model=...)` works with
 any OpenAI-compatible endpoint, or pass any `(system_prompt, user_prompt) ->
 text` function (return `(text, input_tokens, output_tokens)` to get exact
-spend in the report). ctxfit imports no SDK; you hand it the client.
-CLI preview of layer 1: `ctxfit mask convo.json --report r.json`.
+spend in the report; raise `SummaryTruncated` if the provider cut the answer
+off). ctxfit imports no SDK; you hand it the client.
+CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
+(`--offload` adds the original outputs; that report file is written owner-only, mode 0600).
+
+**No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
+the summariser call yourself (async, a queue, another process), use the pure
+functions the TypeScript port (calas-gateway) mirrors:
+
+```python
+from ctxfit import NotesConfig, SummaryOutcome, finish_context, plan_context
+
+plan = plan_context(messages, system=system, config=NotesConfig(), state=saved_state)
+outcome = None
+if plan.summary:                       # at most one call per request
+    text = my_cheap_model(plan.summary.system, plan.summary.user)
+    outcome = SummaryOutcome.ok(text, input_tokens, output_tokens)   # or .timeout() / .error("...")
+result = finish_context(plan, outcome)  # result.messages, result.state, result.report
+saved_state = result.state.to_dict()
+```
 
 **What it saves, and the evidence.** Masking old observations first cut agent
 cost by more than half with equal or better task success in JetBrains
@@ -208,11 +227,23 @@ are updated incrementally: one summariser call per cut move, none while the
 history prefix is unchanged.
 
 **What it protects.** System/developer messages, `pinned: True` messages,
-the first user message (the task) and any message whose text contains `[pin]`
-are never masked and never summarised: summaries were shown to drop rules
-(0% → 30% violations, arXiv 2606.22528) and keeping rules outside the
-summary brought that back to 0%. Tool calls are never modified; a cut never
-separates a call from its result. Inputs are never mutated.
+the first user message (the task) and any user/system/developer message whose
+own text contains `[pin]` are never masked and never summarised: summaries
+were shown to drop rules (0% → 30% violations, arXiv 2606.22528) and keeping
+rules outside the summary brought that back to 0%. An assistant message or a
+tool output cannot pin itself with `[pin]` (use `pinned: True`). The
+`pinned` key is a ctxfit directive, so it is removed from the Anthropic/OpenAI
+messages ctxfit returns. Tool calls are never modified; a cut never separates
+a call from its result (pairing is checked before any summariser call, even
+with reused or missing tool ids). Inputs are never mutated.
+
+**Prompt injection.** Tool output is untrusted. It reaches the summariser
+labelled `[bash result - untrusted data]` with every line indented, so no
+line of it can pose as a message or a rule, and the summariser is told to
+record facts from it but never instructions or permissions. Its answer is
+cleaned before use: `[pin]` tags and anything that looks like a notes header
+are removed and secrets scrubbed. This lowers the risk; it does not remove it
+(a summariser can still be talked into writing a false "fact").
 
 **Trade-offs, plainly.**
 
@@ -229,11 +260,21 @@ separates a call from its result. Inputs are never mutated.
   net (the evicted turns are read once by the summariser); it pays back on
   the requests after it.
 - **Failures fall back, never fail.** An exception, an empty answer, an
-  answer over 2× `notes_max_tokens`, or a timeout keeps the previous notes
-  and cut and reports `summariser_failed`.
-- **Secrets.** Rendered events go through a scrubber (`sk-`/`sk-ant-` keys,
-  `AKIA` keys, GitHub tokens, JWTs, PEM private keys, `password: ...`) before
-  the summariser sees them.
+  answer over 2× `notes_max_tokens`, a truncated answer, or a timeout keeps
+  the previous notes and cut and reports `summariser_failed` with a short
+  `failure_reason`. Retries back off: after a failure no new summary is tried
+  for `min_evict_turns` turns, doubling per failure up to 64 turns
+  (`summariser_backoff`), so a broken summariser is not called on every request.
+- **Secrets.** Each message's full text is scrubbed before it is cut down for
+  the summariser: PEM private keys (also unterminated), `sk-`/`sk-ant-`/
+  `sk-proj-` keys, Stripe, AWS, GitHub, GitLab, Slack, Google and Hugging Face
+  tokens, JWTs, `Bearer` tokens, `user:pass@` in URLs and `password: …` /
+  `api_key=…` style values (the key name is kept). Previous notes and the
+  summariser's answer are scrubbed too.
+- **Provider-managed context is left alone.** If the request uses
+  `context_management`, or carries thinking/compaction/server-tool blocks,
+  ctxfit returns it unchanged (`provider_context`); pass `force=True` to
+  rewrite anyway.
 
 **Limits.**
 
@@ -241,21 +282,36 @@ separates a call from its result. Inputs are never mutated.
   implementations trigger at exactly the same point; budget with a margin.
 - A masked output is gone from the prompt. If the model needs it again, it has
   to re-run the tool, or your loop has to serve it from `keeper.recall(id8)`
-  / the `offload=` callback (in memory only unless you store it).
+  / the `offload=` callback. The in-memory store is capped
+  (`offload_max_bytes`, default 16 MB, oldest dropped first; `0` keeps
+  nothing in memory and only calls your callback).
 - Notes are lossy and only as good as your summariser model. ctxfit does not
   check them for accuracy, only for length and emptiness.
 - The scrubber is a regex safety net, not a guarantee; secrets in unusual
   formats get through.
-- The summariser call is synchronous; `summarizer_timeout_s` stops waiting
-  but cannot cancel the call already in flight (it may still be billed).
+- `fit` is synchronous: it blocks for the summariser call. The call has a
+  20 s timeout by default (`summarizer_timeout_s`) and runs on a small shared
+  pool of daemon threads; after a timeout ctxfit stops waiting and ignores the
+  late answer, but cannot cancel a call already in flight (it may still be
+  billed). `await keeper.afit(...)` runs `fit` in a worker thread for asyncio code.
+- A `NotesKeeper` is **not thread-safe**: one keeper per conversation, and
+  don't call it from two threads at once (`plan_context`/`finish_context`
+  themselves are pure and safe anywhere).
 - Editing or forking earlier history discards the notes and rebuilds them
-  (one more summariser call); state is per conversation.
+  (one more summariser call); state is per conversation. State from ctxfit
+  0.2.0 (`version: 1`) is accepted and discarded on the next call
+  (`spec_changed`): the notes are rebuilt once.
+- Conversations over 5,000 messages are passed through untouched
+  (`too_many_messages`).
 - Layer 2 needs the whole history each call; it is not a streaming API.
 - Shapes: Anthropic Messages, OpenAI chat.completions, ctxfit generic dicts
-  and `Message` lists. Not LangChain objects.
+  and `Message` lists (which come back as `Message` objects with their `meta`
+  kept). Not LangChain objects. The notes layer works on the raw provider JSON
+  with its own turn and pin rules; it does not go through `normalize()`.
 
 Exact behaviour, including how every ambiguous case is resolved, is pinned by
-shared conformance fixtures that the TypeScript port (calas-gateway) runs too.
+shared conformance fixtures (spec v2) that the TypeScript port (calas-gateway)
+runs too.
 
 ## Safety rules (load-bearing)
 
