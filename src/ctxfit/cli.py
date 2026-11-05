@@ -94,6 +94,29 @@ def cmd_fit(args: argparse.Namespace) -> int:
     return 2 if report.over_budget else 0
 
 
+def cmd_mask(args: argparse.Namespace) -> int:
+    from .notes import mask_observations
+
+    raw = _load(args.input)
+    masked, report = mask_observations(
+        raw,
+        keep_recent_turns=args.keep_recent_turns,
+        mask_chunk_turns=args.chunk_turns,
+        min_mask_chars=args.min_chars,
+        flavor=args.flavor,
+    )
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(masked, fh, indent=2, ensure_ascii=False)
+        print(f"wrote {args.out}")
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as fh:
+            json.dump(report.to_dict(include_offload=args.offload), fh, indent=2)
+        print(f"wrote {args.report}")
+    print(report.summary())
+    return 0
+
+
 def cmd_estimate(args: argparse.Namespace) -> int:
     from .estimate import get_estimator
 
@@ -151,6 +174,20 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--report", default=None, help="write FitReport JSON here")
     f.set_defaults(func=cmd_fit)
 
+    mk = sub.add_parser(
+        "mask", help="preview observation masking (running notes layer 1); no model calls"
+    )
+    mk.add_argument("input", help="JSON file: array of messages (or a body with 'messages')")
+    mk.add_argument("--keep-recent-turns", type=int, default=4)
+    mk.add_argument("--chunk-turns", type=int, default=4, help="boundary moves in chunks of N")
+    mk.add_argument("--min-chars", type=int, default=400, help="only mask outputs this long")
+    mk.add_argument("--out", default=None, help="write masked messages here (JSON)")
+    mk.add_argument("--report", default=None, help="write MaskReport JSON here")
+    mk.add_argument(
+        "--offload", action="store_true", help="include original outputs (id8 -> text) in report"
+    )
+    mk.set_defaults(func=cmd_mask)
+
     e = sub.add_parser("estimate", help="quick token estimate for text")
     e.add_argument("text", nargs="?", default="", help="text to estimate")
     e.add_argument("--file", default=None, help="read text from file instead")
@@ -162,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (ValueError, FileNotFoundError, ImportError) as exc:
+    except (ValueError, TypeError, FileNotFoundError, ImportError) as exc:
         print(f"ctxfit: error: {exc}", file=sys.stderr)
         return 1
 

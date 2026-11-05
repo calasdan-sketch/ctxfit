@@ -7,7 +7,7 @@ result sits uncompressed in context for the rest of the run.
 
 **ctxfit** is the standalone layer every agent team hand-rolls and nobody
 ships: structural context compression with budget enforcement. No LLM calls,
-no framework lock-in, deterministic.
+no framework lock-in, deterministic. Opt-in running notes for long agent runs.
 
 ```python
 import ctxfit
@@ -153,6 +153,110 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
+## Running notes (opt-in, 0.2.0)
+
+Long agent runs re-send the whole conversation every turn. Most of that is old
+tool output nobody will read again. `ctxfit.notes` cuts it in two layers, both
+off unless you call them:
+
+1. **Observation masking** — no model call. Old tool outputs (≥ 400 chars,
+   older than the last 4 turns) become one line:
+   `[ctxfit: tool output hidden - bash - 18234 chars - id 3f9a1c07]`.
+   The id is the first 8 hex of the output's sha256, so you can keep the
+   original and look it up.
+2. **Running notes** — once the masked prompt still passes a high-water mark
+   (default 60,000 est. tokens), the oldest turns are replaced by ONE notes
+   message written by a cheap summariser model *you* supply. Pinned rules stay
+   outside the notes, verbatim.
+
+```python
+import json
+
+import anthropic
+from ctxfit import NotesKeeper, anthropic_summarizer, mask_observations
+
+# Layer 1 only: deterministic, free
+masked, report = mask_observations(messages)          # Anthropic, OpenAI or generic shape
+print(report.summary())
+
+# Both layers: keep one NotesKeeper per conversation
+keeper = NotesKeeper(anthropic_summarizer(anthropic.Anthropic()))  # model="claude-haiku-5-5"
+fitted, report = keeper.fit(body["messages"], system=body.get("system"))
+print(report.summary())   # example output:
+# est. tokens: 71,300 → 24,900 (−65.1%) [chars/4]
+#   masked 9 tool output(s), 96,420 chars (boundary turn 20 of 26)
+#   running notes replace 61 earlier message(s) (cut at turn 12, notes ~900 est. tokens)
+#   net saved: 46,400 est. tokens
+#   prompt-cache prefix: stable
+
+state = json.dumps(keeper.state_dict())   # persist between processes; keeper.load_state(...)
+```
+
+Always pass the **full original history** to `keeper.fit()`; it re-applies
+the same cut every time. `openai_summarizer(client, model=...)` works with
+any OpenAI-compatible endpoint, or pass any `(system_prompt, user_prompt) ->
+text` function (return `(text, input_tokens, output_tokens)` to get exact
+spend in the report). ctxfit imports no SDK; you hand it the client.
+CLI preview of layer 1: `ctxfit mask convo.json --report r.json`.
+
+**What it saves, and the evidence.** Masking old observations first cut agent
+cost by more than half with equal or better task success in JetBrains
+Research's study of coding agents (Dec 2025); summarising on top of masking
+only added a further 7–11%, and the summariser's own spend was over 7% of the
+bill. So masking does the heavy lifting, notes are the last resort, and they
+are updated incrementally: one summariser call per cut move, none while the
+history prefix is unchanged.
+
+**What it protects.** System/developer messages, `pinned: True` messages,
+the first user message (the task) and any message whose text contains `[pin]`
+are never masked and never summarised: summaries were shown to drop rules
+(0% → 30% violations, arXiv 2606.22528) and keeping rules outside the
+summary brought that back to 0%. Tool calls are never modified; a cut never
+separates a call from its result. Inputs are never mutated.
+
+**Trade-offs, plainly.**
+
+- **Prompt cache.** Any rewrite of an earlier part of the prompt breaks
+  provider prompt caching. The masking boundary moves only every 4 turns and
+  the notes only when the high-water mark is passed, so between moves the
+  prefix is byte-identical (`report.cache_stable` tells you). Each move costs
+  one full cache write.
+- **Rules can still drop** if they are not pinned. Pin them (`[pin]` in the
+  text, or `pinned: True`).
+- **The summariser costs money.** It is real spend and the report always
+  subtracts it: `net_saved_tokens_est = before − after − summariser_in −
+  summariser_out`. The request that moves the cut usually shows a *negative*
+  net (the evicted turns are read once by the summariser); it pays back on
+  the requests after it.
+- **Failures fall back, never fail.** An exception, an empty answer, an
+  answer over 2× `notes_max_tokens`, or a timeout keeps the previous notes
+  and cut and reports `summariser_failed`.
+- **Secrets.** Rendered events go through a scrubber (`sk-`/`sk-ant-` keys,
+  `AKIA` keys, GitHub tokens, JWTs, PEM private keys, `password: ...`) before
+  the summariser sees them.
+
+**Limits.**
+
+- Estimates are chars/4 (not your tokenizer) so the Python and TypeScript
+  implementations trigger at exactly the same point; budget with a margin.
+- A masked output is gone from the prompt. If the model needs it again, it has
+  to re-run the tool, or your loop has to serve it from `keeper.recall(id8)`
+  / the `offload=` callback (in memory only unless you store it).
+- Notes are lossy and only as good as your summariser model. ctxfit does not
+  check them for accuracy, only for length and emptiness.
+- The scrubber is a regex safety net, not a guarantee; secrets in unusual
+  formats get through.
+- The summariser call is synchronous; `summarizer_timeout_s` stops waiting
+  but cannot cancel the call already in flight (it may still be billed).
+- Editing or forking earlier history discards the notes and rebuilds them
+  (one more summariser call); state is per conversation.
+- Layer 2 needs the whole history each call; it is not a streaming API.
+- Shapes: Anthropic Messages, OpenAI chat.completions, ctxfit generic dicts
+  and `Message` lists. Not LangChain objects.
+
+Exact behaviour, including how every ambiguous case is resolved, is pinned by
+shared conformance fixtures that the TypeScript port (calas-gateway) runs too.
+
 ## Safety rules (load-bearing)
 
 1. **Pair-atomicity.** Tool calls and results are linked by ID and kept,
@@ -179,9 +283,9 @@ Pinned messages are never dropped; truncated only with explicit opt-in
   (marked `…`); only applied when it actually saves tokens.
 - **Exact-match dedup only.** Near-duplicates are not merged — deliberate;
   fuzzy matching is unexplainable and risky.
-- **No LLM summarization, ever.** Structural compression only. (Subclass
-  `Strategy` with your own summarizer if you want semantic compression —
-  that's your API bill, not ours.)
+- **No LLM calls in `fit()`, ever.** The core pipeline is structural only.
+  Summarisation exists only in the opt-in running notes, through a
+  summariser you supply and pay for (see "Running notes").
 - **Turn counting is user-message-led.** Tool-heavy loops with few user turns
   should use `aggressive=True`.
 - **`to_anthropic` emits system messages as `{"role": "system"}` dicts** —
@@ -194,7 +298,7 @@ Pinned messages are never dropped; truncated only with explicit opt-in
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest          # 104 tests
+.venv/bin/python -m pytest          # 186 tests
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
 ```
