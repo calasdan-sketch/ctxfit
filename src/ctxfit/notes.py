@@ -85,7 +85,7 @@ from .messages import Message, detect_flavor
 # ---------------------------------------------------------------------------
 
 STATE_VERSION = 2
-ALGO = "rn-2"
+ALGO = "rn-3"
 MAX_MESSAGES = 5_000
 """Above this many messages, masking and notes are skipped (``too_many_messages``)."""
 
@@ -111,6 +111,9 @@ Both placeholders are filled in one pass (text inside the notes is never re-expa
 NO_NOTES_YET = "(none yet)"
 
 MASK_MARKER = "[ctxfit: tool output hidden - {tool} - {n} chars - id {id8}]"
+SQUEEZE_HEADER = "[ctxfit: tool output squeezed - {tool} - {n} chars - id {id8}]"
+MASK_STYLES = ("hide", "squeeze")
+RECALL_TOOL_NAME = "ctxfit_recall"
 NOTES_HEADER = (
     "[ctxfit running notes - a summary of {k} earlier messages, may quote tool output; "
     "pinned rules above still apply]"
@@ -769,24 +772,188 @@ def _marker(tool: str, text: str) -> tuple[str, str]:
     return MASK_MARKER.format(tool=tool, n=_clen(text), id8=id8), id8
 
 
+# -- squeeze digests (spec v3 G) --------------------------------------------
+
+SQUEEZE_MAX_RATIO_NUM, SQUEEZE_MAX_RATIO_DEN = 2, 5  # digest <= 40% of the original
+_SQUEEZE_LINE_RE = re.compile(
+    r"error|exception|fail|fatal|panic|traceback|denied|refused|timeout|warning",
+    re.ASCII | re.IGNORECASE,
+)
+_SQUEEZE_MIN_LINES = 8
+_SQUEEZE_HEAD = _SQUEEZE_TAIL = 3
+_SQUEEZE_MAX_MATCHES = 20
+_SQUEEZE_LINE_CAP = 200
+_SQUEEZE_ITEM_CAP = 300
+_SQUEEZE_MAX_KEYS = 30
+_SQUEEZE_MAX_PAIRS = 10
+_SQUEEZE_VALUE_CAP = 80
+_SQUEEZE_TEXT_HEAD, _SQUEEZE_TEXT_TAIL = 300, 200
+
+
+def _cp_head(s: str, n: int) -> str:
+    w = _wf(s)
+    return w[:n] if len(w) > n else s
+
+
+def _strict_json(text: str) -> Any:
+    """``JSON.parse`` semantics for an object/array (None when not one)."""
+    try:
+        v = json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return None
+    return v if isinstance(v, (dict, list)) else None
+
+
+def _digest_json(v: Any) -> list[str]:
+    if isinstance(v, list):
+        if not v:
+            return ["array of 0 items"]
+        lines = [f"array of {len(v)} items; first item: {_cp_head(_json(v[0]), _SQUEEZE_ITEM_CAP)}"]
+        keys: list[str] = []
+        seen: set[str] = set()
+        for item in v:
+            if isinstance(item, dict):
+                for k in _js_key_order(item):
+                    if k not in seen:
+                        seen.add(k)
+                        keys.append(k)
+        if keys:
+            lines.append("keys: " + ", ".join(keys[:_SQUEEZE_MAX_KEYS]))
+        return lines
+    keys = _js_key_order(v)
+    lines = ["object with keys: " + ", ".join(keys[:_SQUEEZE_MAX_KEYS])]
+    pairs = 0
+    for k in keys:
+        if pairs >= _SQUEEZE_MAX_PAIRS:
+            break
+        val = v[k]
+        if isinstance(val, dict | list):
+            continue
+        shown = val if isinstance(val, str) else _json(val)
+        lines.append(f"{k} = {_cp_head(shown, _SQUEEZE_VALUE_CAP)}")
+        pairs += 1
+    return lines
+
+
+def _digest_lines(lines: list[str]) -> list[str]:
+    runs: list[list[Any]] = []  # [line, count]
+    for line in lines:
+        if runs and runs[-1][0] == line:
+            runs[-1][1] += 1
+        else:
+            runs.append([line, 1])
+
+    def show(run: list[Any]) -> str:
+        text = _cp_head(run[0], _SQUEEZE_LINE_CAP)
+        return f"{text}  (x{run[1]})" if run[1] > 1 else text
+
+    if len(runs) <= _SQUEEZE_HEAD + _SQUEEZE_TAIL:
+        return [show(r) for r in runs]
+    head, middle, tail = (
+        runs[:_SQUEEZE_HEAD],
+        runs[_SQUEEZE_HEAD:-_SQUEEZE_TAIL],
+        runs[-_SQUEEZE_TAIL:],
+    )
+    hits = [r for r in middle if _SQUEEZE_LINE_RE.search(r[0])][:_SQUEEZE_MAX_MATCHES]
+    hit_ids = {id(r) for r in hits}
+    omitted = sum(r[1] for r in middle if id(r) not in hit_ids)
+    return (
+        [show(r) for r in head]
+        + [f"... {omitted} lines omitted ..."]
+        + [show(r) for r in hits]
+        + [show(r) for r in tail]
+    )
+
+
+def squeeze_digest(tool: str, text: str) -> str:
+    """The v3 squeeze digest of a tool output (header + scrubbed body), regardless of size."""
+    header = SQUEEZE_HEADER.format(tool=tool, n=_clen(text), id8=_sha256(text)[:8])
+    parsed = _strict_json(text)
+    if parsed is not None:
+        body = _digest_json(parsed)
+    else:
+        lines = text.split("\n")
+        if len(lines) >= _SQUEEZE_MIN_LINES:
+            body = _digest_lines(lines)
+        else:
+            w = _wf(text)
+            body = [w[:_SQUEEZE_TEXT_HEAD] + " ... " + w[-_SQUEEZE_TEXT_TAIL:]]
+    return header + "\n" + scrub_secrets("\n".join(body))
+
+
+def _replacement(style: str, tool: str, text: str) -> tuple[str, str, bool]:
+    """(replacement text, id8, squeezed?) for an output that is being masked."""
+    marker, id8 = _marker(tool, text)
+    if style == "squeeze":
+        digest = squeeze_digest(tool, text)
+        if SQUEEZE_MAX_RATIO_DEN * _clen(digest) <= SQUEEZE_MAX_RATIO_NUM * _clen(text):
+            return digest, id8, True
+    return marker, id8, False
+
+
 @dataclass
 class _Masked:
     messages: list[dict[str, Any]]
     boundary: int
-    # raw index -> list of (id8, original_text) masked in that message
-    masked_at: dict[int, list[tuple[str, str]]]
+    # raw index -> list of (id8, original_text, squeezed?) masked in that message
+    masked_at: dict[int, list[tuple[str, str, bool]]]
 
 
-def _apply_mask(conv: _Conversation, cfg: NotesConfig) -> _Masked:
-    b = mask_boundary(conv.turn_count, cfg.keep_recent_turns, cfg.mask_chunk_turns)
-    out = copy.deepcopy(conv.raw)
-    masked_at: dict[int, list[tuple[str, str]]] = {}
-    if b <= 0:
-        return _Masked(out, b, masked_at)
+def _eligible_outputs(conv: _Conversation, cfg: NotesConfig) -> list[tuple[int, int, int, str]]:
+    """(message index, result position, turn, text) of every output masking may replace."""
+    out: list[tuple[int, int, int, str]] = []
+    excluded = set(cfg.exclude_tools)
     for v in conv.views:
-        if v.turn >= b or v.pinned or not v.results:
+        if v.pinned or not v.results:
             continue
-        m = out[v.index]
+        positions = range(len(v.results)) if conv.flavor == "anthropic" else range(1)
+        for rpos in positions:
+            text = v.results[rpos][1]
+            if _clen(text) < cfg.min_mask_chars:
+                continue
+            if conv.tool_name(v.index, rpos) in excluded:
+                continue
+            out.append((v.index, rpos, v.turn, text))
+    return out
+
+
+def _choose_boundary(conv: _Conversation, cfg: NotesConfig, stored: int) -> int:
+    """Applied mask boundary (spec v3 F2): chunked, never backwards, moves only if worth it."""
+    formula = mask_boundary(conv.turn_count, cfg.keep_recent_turns, cfg.mask_chunk_turns)
+    if stored > formula:  # history got shorter: the stored boundary no longer applies
+        stored = 0
+    if formula == stored:
+        return stored
+    newly = sum(
+        _clen(text)
+        for _i, _r, turn, text in _eligible_outputs(conv, cfg)
+        if stored <= turn < formula
+    )
+    return formula if newly >= cfg.clear_at_least_chars else stored
+
+
+def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = None) -> _Masked:
+    b = (
+        mask_boundary(conv.turn_count, cfg.keep_recent_turns, cfg.mask_chunk_turns)
+        if boundary is None
+        else boundary
+    )
+    out = copy.deepcopy(conv.raw)
+    masked = _Masked(out, b, {})
+    if b <= 0:
+        return masked
+    targets: dict[int, set[int]] = {}
+    for idx, rpos, turn, _text in _eligible_outputs(conv, cfg):
+        if turn < b:
+            targets.setdefault(idx, set()).add(rpos)
+
+    def replace(idx: int, rpos: int, text: str) -> str:
+        new, id8, squeezed = _replacement(cfg.mask_style, conv.tool_name(idx, rpos), text)
+        masked.masked_at.setdefault(idx, []).append((id8, text, squeezed))
+        return new
+
+    for idx, positions in targets.items():
+        m = out[idx]
         if conv.flavor == "anthropic":
             content = m.get("content")
             if not isinstance(content, list):
@@ -795,25 +962,20 @@ def _apply_mask(conv: _Conversation, cfg: NotesConfig) -> _Masked:
             rpos = 0
             for blk in content:
                 if isinstance(blk, dict) and blk.get("type") == "tool_result":
-                    text = _anthropic_result_text(blk)
-                    if _clen(text) >= cfg.min_mask_chars:
-                        marker, id8 = _marker(conv.tool_name(v.index, rpos), text)
+                    if rpos in positions:
+                        text = _anthropic_result_text(blk)
+                        new = replace(idx, rpos, text)
                         blk = dict(blk)
                         if isinstance(blk.get("content"), list):
-                            blk["content"] = [{"type": "text", "text": marker}]
+                            blk["content"] = [{"type": "text", "text": new}]
                         else:
-                            blk["content"] = marker
-                        masked_at.setdefault(v.index, []).append((id8, text))
+                            blk["content"] = new
                     rpos += 1
                 new_blocks.append(blk)
             m["content"] = new_blocks
         else:
-            _cid, text = v.results[0]
-            if _clen(text) >= cfg.min_mask_chars:
-                marker, id8 = _marker(conv.tool_name(v.index, 0), text)
-                m["content"] = marker
-                masked_at.setdefault(v.index, []).append((id8, text))
-    return _Masked(out, b, masked_at)
+            m["content"] = replace(idx, 0, conv.views[idx].results[0][1])
+    return masked
 
 
 # ---------------------------------------------------------------------------
@@ -884,12 +1046,25 @@ class NotesConfig:
     low_water_tokens: int = 30_000
     notes_max_tokens: int = 1_500
     min_evict_turns: int = 4
+    exclude_tools: tuple[str, ...] = ()
+    clear_at_least_chars: int = 0
+    mask_style: str = "hide"
 
     def __post_init__(self) -> None:
         for f in dataclasses.fields(self):
+            if f.name in ("exclude_tools", "mask_style"):
+                continue
             v = getattr(self, f.name)
             if not isinstance(v, int) or isinstance(v, bool):
                 raise ValueError(f"{f.name} must be an int")
+        tools = self.exclude_tools
+        if isinstance(tools, str) or not all(isinstance(t, str) for t in tools):
+            raise ValueError("exclude_tools must be a list of tool names")
+        object.__setattr__(self, "exclude_tools", tuple(tools))
+        if self.mask_style not in MASK_STYLES:
+            raise ValueError("mask_style must be 'hide' or 'squeeze'")
+        if self.clear_at_least_chars < 0:
+            raise ValueError("clear_at_least_chars must be >= 0")
         _check_mask_config(self.keep_recent_turns, self.mask_chunk_turns, self.min_mask_chars)
         if self.low_water_tokens <= 0 or self.high_water_tokens <= self.low_water_tokens:
             raise ValueError("need 0 < low_water_tokens < high_water_tokens")
@@ -917,6 +1092,7 @@ _STATE_INTS = (
     "summariser_output_tokens",
     "failures",
     "retry_at_turn",
+    "mask_boundary",
     "last_output_len",
 )
 _STATE_STRS = ("prefix_hash", "notes", "updated_at", "last_output_hash")
@@ -924,7 +1100,11 @@ _STATE_STRS = ("prefix_hash", "notes", "updated_at", "last_output_hash")
 
 @dataclass
 class NotesState:
-    """What is remembered per conversation between requests (spec v2 field names)."""
+    """What is remembered per conversation between requests (spec field names).
+
+    ``mask_boundary`` is the boundary applied last time (spec v3 F2): it never
+    moves backwards, except after a fork or a spec change resets the state.
+    """
 
     version: int = STATE_VERSION
     algo: str = ALGO
@@ -938,6 +1118,7 @@ class NotesState:
     summariser_output_tokens: int = 0
     failures: int = 0
     retry_at_turn: int = 0
+    mask_boundary: int = 0
     updated_at: str | None = None
     last_output_hash: str | None = None
     last_output_len: int = 0
@@ -947,12 +1128,12 @@ class NotesState:
 
     @staticmethod
     def is_current(d: Any) -> bool:
-        """True when ``d`` claims to be a state of this algorithm (version 2, rn-2)."""
+        """True when ``d`` claims to be a state of this algorithm (version 2, rn-3)."""
         return isinstance(d, dict) and d.get("version") == STATE_VERSION and d.get("algo") == ALGO
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> NotesState:
-        """Parse a version-2 ``rn-2`` state. Raises ValueError on anything else."""
+        """Parse a version-2 ``rn-3`` state. Raises ValueError on anything else."""
         if not isinstance(d, dict):
             raise ValueError("state must be a dict")
         if not cls.is_current(d):
@@ -1070,6 +1251,7 @@ class MaskReport:
     tokens_after_est: int
     offload: dict[str, str] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
+    squeezed_outputs: int = 0
 
     @property
     def saved_tokens_est(self) -> int:
@@ -1083,7 +1265,8 @@ class MaskReport:
             f"est. tokens: {self.tokens_before_est:,} → {self.tokens_after_est:,} "
             f"(−{pct:.1f}%) [chars/4]",
             f"  turns {self.turns}, mask boundary at turn {self.mask_boundary}",
-            f"  masked {self.masked_outputs} tool output(s), {self.masked_chars:,} chars",
+            f"  masked {self.masked_outputs} tool output(s), {self.masked_chars:,} chars"
+            + (f" ({self.squeezed_outputs} squeezed)" if self.squeezed_outputs else ""),
         ]
         skipped = [r for r in self.reasons if r in ("provider_context", "too_many_messages")]
         if skipped:
@@ -1096,6 +1279,7 @@ class MaskReport:
             "mask_boundary": self.mask_boundary,
             "masked_outputs": self.masked_outputs,
             "masked_chars": self.masked_chars,
+            "squeezed_outputs": self.squeezed_outputs,
             "tokens_before_est": self.tokens_before_est,
             "tokens_after_est": self.tokens_after_est,
             "saved_tokens_est": self.saved_tokens_est,
@@ -1124,6 +1308,7 @@ class NotesReport:
     tokens_after_est: int = 0
     masked_outputs: int = 0
     masked_chars: int = 0
+    squeezed_outputs: int = 0
     notes_applied: bool = False
     evicted_messages: int = 0
     summariser_calls: int = 0
@@ -1390,8 +1575,7 @@ def plan_context(
     if spec_changed:
         plan.reasons.append("spec_changed")
     conv = _Conversation(fl, raw)
-    masked = _apply_mask(conv, cfg)
-    plan.conv, plan.masked = conv, masked
+    plan.conv = conv
     st = plan.state
     if mode == "notes" and st.cut_turn > 0:
         c = st.cut_turn
@@ -1406,6 +1590,9 @@ def plan_context(
         else:
             plan.reasons.append("history_forked")
             plan.state = NotesState.carry_cache(st)
+    boundary = _choose_boundary(conv, cfg, plan.state.mask_boundary)
+    masked = _apply_mask(conv, cfg, boundary)
+    plan.masked = masked
     if mode != "notes":
         return plan
     st = plan.state
@@ -1625,11 +1812,13 @@ def finish_context(plan: ContextPlan, outcome: SummaryOutcome | None) -> Context
     for idx_, entries in masked.masked_at.items():
         if idx_ not in kept:
             continue
-        for id8, original in entries:
+        for id8, original, squeezed in entries:
             report.masked_outputs += 1
+            report.squeezed_outputs += squeezed
             report.masked_chars += _clen(original)
             offload.setdefault(id8, original)
     report.offload = offload
+    st.mask_boundary = masked.boundary
     if report.masked_outputs:
         reasons.insert(0, "masked")
 
@@ -1662,8 +1851,10 @@ def mask_observations(
     *,
     context_management: Any = None,
     force: bool = False,
+    exclude_tools: Sequence[str] = (),
+    mask_style: str = "hide",
 ) -> tuple[list[Any], MaskReport]:
-    """Layer 1: hide old tool outputs behind a deterministic marker.
+    """Layer 1: hide (or squeeze) old tool outputs behind a deterministic marker.
 
     Number the turns 0..T-1; the boundary is
     ``B = floor((T - keep_recent_turns) / mask_chunk_turns) * mask_chunk_turns``
@@ -1673,6 +1864,12 @@ def mask_observations(
     Tool calls, ``tool_use_id``/``tool_call_id``, ``is_error`` and every
     other key are preserved (except the ``pinned`` directive, which is
     removed from Anthropic/OpenAI output).
+
+    ``exclude_tools`` names tools whose outputs are never touched;
+    ``mask_style="squeeze"`` replaces an output by a short deterministic
+    digest (head/tail, error lines, JSON shape) when that digest is at most
+    40% of the original, else by the marker. (``clear_at_least_chars``
+    needs remembered state: use :class:`NotesKeeper` or :func:`plan_context`.)
 
     Returns ``(messages_in_original_shape, MaskReport)``; ``report.offload``
     maps each ``id8`` to the original text so callers can store it for recall.
@@ -1684,6 +1881,8 @@ def mask_observations(
         keep_recent_turns=keep_recent_turns,
         mask_chunk_turns=mask_chunk_turns,
         min_mask_chars=min_mask_chars,
+        exclude_tools=tuple(exclude_tools),
+        mask_style=mask_style,
     )
     plan = plan_context(
         messages,
@@ -1704,6 +1903,7 @@ def mask_observations(
         tokens_after_est=r.tokens_after_est,
         offload=dict(res.offload),
         reasons=list(r.reasons),
+        squeezed_outputs=r.squeezed_outputs,
     )
     return res.messages, report
 
@@ -1793,6 +1993,77 @@ def call_summarizer(
 
 
 # ---------------------------------------------------------------------------
+# Recall (spec v3 H)
+# ---------------------------------------------------------------------------
+
+RECALL_DESCRIPTION = (
+    "Fetch the full original text of an earlier tool output that was hidden or squeezed to "
+    "save context. Use the 8-character id shown in its marker, e.g. "
+    "'[ctxfit: tool output hidden - bash - 18234 chars - id 3f9a1c07]' -> id '3f9a1c07'. "
+    "Only call this when you really need the full output again."
+)
+_RECALL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"id": {"type": "string", "description": "The 8-character id from the marker."}},
+    "required": ["id"],
+}
+
+
+def recall_tool(flavor: str = "anthropic") -> dict[str, Any]:
+    """The ready-made ``ctxfit_recall`` tool definition to add to your request's ``tools``.
+
+    ``flavor`` is ``"anthropic"`` (Messages API tool) or ``"openai"``
+    (chat.completions function tool).
+    """
+    schema = copy.deepcopy(_RECALL_SCHEMA)
+    if flavor == "anthropic":
+        return {"name": RECALL_TOOL_NAME, "description": RECALL_DESCRIPTION, "input_schema": schema}
+    if flavor == "openai":
+        return {
+            "type": "function",
+            "function": {
+                "name": RECALL_TOOL_NAME,
+                "description": RECALL_DESCRIPTION,
+                "parameters": schema,
+            },
+        }
+    raise ValueError("flavor must be 'anthropic' or 'openai'")
+
+
+def handle_recall(tool_call: dict[str, Any], lookup: Callable[[str], str | None]) -> dict[str, Any]:
+    """Answer a ``ctxfit_recall`` call with ``lookup(id8)``; see :meth:`NotesKeeper.handle_recall`."""
+    if not isinstance(tool_call, dict):
+        raise TypeError("tool_call must be a dict")
+    if tool_call.get("type") == "tool_use":  # Anthropic
+        args = tool_call.get("input")
+        flavor, call_id = "anthropic", tool_call.get("id")
+    elif isinstance(tool_call.get("function"), dict):  # OpenAI
+        raw = tool_call["function"].get("arguments")
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            args = None
+        flavor, call_id = "openai", tool_call.get("id")
+    else:
+        raise ValueError("not an Anthropic tool_use block or an OpenAI tool call")
+    id8 = args.get("id") if isinstance(args, dict) else None
+    text = lookup(id8.strip().lower()) if isinstance(id8, str) else None
+    error = text is None
+    if error:
+        text = (
+            f"ctxfit_recall: no stored output with id {id8!r}"
+            if isinstance(id8, str)
+            else "ctxfit_recall: missing string argument 'id'"
+        )
+    if flavor == "anthropic":
+        out: dict[str, Any] = {"type": "tool_result", "tool_use_id": call_id, "content": text}
+        if error:
+            out["is_error"] = True
+        return out
+    return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+
+# ---------------------------------------------------------------------------
 # NotesKeeper: the thin stateful wrapper
 # ---------------------------------------------------------------------------
 
@@ -1815,6 +2086,12 @@ class NotesKeeper:
             rejected as a failure.
         min_evict_turns: a cut advances by at least this many turns; also the
             base of the failure backoff.
+        exclude_tools: tool names whose outputs are never masked or squeezed.
+        clear_at_least_chars: the mask boundary only moves when the outputs it
+            would newly mask total at least this many chars (0 = always), so a
+            move never costs a cache write for a small saving.
+        mask_style: ``"hide"`` (one-line marker) or ``"squeeze"`` (a short
+            deterministic digest when it is at most 40% of the original).
         summarizer_timeout_s: wall-clock limit per summariser call (default
             20 s; ``None`` calls it inline with no limit). The call runs on a
             shared pool of daemon threads; a late result is ignored.
@@ -1844,6 +2121,9 @@ class NotesKeeper:
         low_water_tokens: int = 30_000,
         notes_max_tokens: int = 1_500,
         min_evict_turns: int = 4,
+        exclude_tools: Sequence[str] = (),
+        clear_at_least_chars: int = 0,
+        mask_style: str = "hide",
         summarizer_timeout_s: float | None = 20,
         offload: Callable[[str, str], None] | None = None,
         offload_max_bytes: int = 16 * 1024 * 1024,
@@ -1859,6 +2139,9 @@ class NotesKeeper:
             low_water_tokens=low_water_tokens,
             notes_max_tokens=notes_max_tokens,
             min_evict_turns=min_evict_turns,
+            exclude_tools=tuple(exclude_tools),
+            clear_at_least_chars=clear_at_least_chars,
+            mask_style=mask_style,
         )
         if summarizer_timeout_s is not None and summarizer_timeout_s <= 0:
             raise ValueError("summarizer_timeout_s must be > 0")
@@ -1906,6 +2189,17 @@ class NotesKeeper:
     def recall(self, id8: str) -> str | None:
         """Original text of a masked tool output, if it is still in the offload store."""
         return self.offload.get(id8)
+
+    def handle_recall(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        """Answer a ``ctxfit_recall`` tool call (see :func:`recall_tool`).
+
+        ``tool_call`` is an Anthropic ``tool_use`` block or an OpenAI
+        ``tool_calls[]`` item. Returns the matching tool-result payload: an
+        Anthropic ``tool_result`` block (``is_error`` when the id is unknown)
+        or an OpenAI ``{"role": "tool", ...}`` message. The original text is
+        returned unchanged (it is your own conversation's data).
+        """
+        return handle_recall(tool_call, self.recall)
 
     def state_dict(self) -> dict[str, Any]:
         """JSON-safe state for persistence (spec v2 field names, ``version: 2``)."""
@@ -2099,6 +2393,8 @@ __all__ = [
     "ALGO",
     "MASK_MARKER",
     "MAX_MESSAGES",
+    "RECALL_TOOL_NAME",
+    "SQUEEZE_HEADER",
     "NOTES_HEADER",
     "STATE_VERSION",
     "SUMMARISER_SYSTEM_PROMPT",
@@ -2119,10 +2415,13 @@ __all__ = [
     "canonical_json",
     "estimate_tokens",
     "finish_context",
+    "handle_recall",
     "mask_boundary",
     "mask_observations",
     "openai_summarizer",
     "plan_context",
+    "recall_tool",
     "sanitize_notes",
     "scrub_secrets",
+    "squeeze_digest",
 ]

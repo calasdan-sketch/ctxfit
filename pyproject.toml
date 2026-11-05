@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ctxfit"
-version = "0.3.0"
+version = "0.4.0"
 description = "Drop-in context-window optimizer for any agent loop: structural compression, section budgets, framework adapters"
 readme = "README.md"
 requires-python = ">=3.10"

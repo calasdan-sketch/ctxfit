@@ -153,7 +153,7 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
-## Running notes (opt-in, 0.3.0)
+## Running notes (opt-in, 0.4.0)
 
 Long agent runs re-send the whole conversation every turn. Most of that is old
 tool output nobody will read again. `ctxfit.notes` cuts it in two layers, both
@@ -201,6 +201,23 @@ spend in the report; raise `SummaryTruncated` if the provider cut the answer
 off). ctxfit imports no SDK; you hand it the client.
 CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
 (`--offload` adds the original outputs; that report file is written owner-only, mode 0600).
+
+**Knobs added in 0.4.0** (all off by default, so 0.3.0 behaviour is unchanged):
+
+- `exclude_tools=["read_file"]` — outputs of these tools are never masked.
+- `clear_at_least_chars=20_000` — the mask boundary only moves when that
+  move hides at least this much. A move rewrites earlier messages and costs a
+  fresh cache write, so small moves are skipped. The applied boundary is
+  remembered in the state and never moves backwards.
+- `mask_style="squeeze"` — instead of a one-line marker, keep a short,
+  deterministic digest: for JSON, its shape and first item or scalar fields;
+  for logs, the first and last lines plus error/fail/warning lines; for
+  other text, the head and tail. Used only when the digest is at most 40% of
+  the original, otherwise the marker. Secrets are scrubbed from it.
+- **Recall.** Hidden outputs stay retrievable by their id. Add
+  `recall_tool("anthropic")` (or `"openai"`) to your request's `tools`; when
+  the model calls `ctxfit_recall`, answer with `keeper.handle_recall(call)`,
+  which returns the ready-made tool result.
 
 **No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
 the summariser call yourself (async, a queue, another process), use the pure
@@ -311,8 +328,28 @@ are removed and secrets scrubbed. This lowers the risk; it does not remove it
   kept). Not LangChain objects. The notes layer works on the raw provider JSON
   with its own turn and pin rules; it does not go through `normalize()`.
 
+**How it compares.** Short and factual; read each project's own docs.
+
+| | ctxfit running notes | [Anthropic context editing](https://platform.claude.com/docs/build-with-claude/context-editing) | [OpenAI compaction](https://developers.openai.com/api/docs/guides/compaction.md) | [Headroom](https://github.com/chopratejas/headroom) | [LLMLingua](https://github.com/microsoft/llmlingua) |
+|---|---|---|---|---|---|
+| Where it runs | Your process | Anthropic's servers (beta header) | OpenAI's servers (Responses API) or `/responses/compact` | Your machine (library, proxy, MCP) | Your machine |
+| Providers | Anthropic + OpenAI-shaped JSON | Claude only | OpenAI only | Several | Any (works on text) |
+| What it does to old tool output | Hides, or squeezes to a digest | Clears oldest results to a placeholder | Folds history into an encrypted compaction item | Compresses by content type (JSON, code, prose) | Drops low-importance tokens |
+| Needs a model to compress | Only for notes (your cheap model) | No (clearing) | Yes, OpenAI's | Text model for prose; JSON/code rules otherwise | Yes (small LM / encoder) |
+| Readable result | Yes, plain text | Yes | No ("opaque") | Yes | Yes, but lossy wording |
+| Get the original back | `ctxfit_recall` / offload | No (your client keeps history) | No | Yes (`headroom_retrieve`) | No |
+| Prompt-cache care | Chunked boundary, `clear_at_least_chars`, `cache_stable` report | `clear_at_least` | n/a (server-managed) | CacheAligner flags volatile content | Not a focus |
+
+ctxfit borrows `exclude_tools` and `clear_at_least` from Anthropic's context
+editing and leaves requests that already use it alone (`provider_context`).
+If you are on Claude only and want zero code, context editing is simpler. If
+you need a summary that a human can read, can audit or that works across
+providers, or a record you can recall from, that is where ctxfit fits.
+Savings claims of other projects are their own; ours, on synthetic
+transcripts only, are in `benchmarks/RESULTS.md` (method stated there).
+
 Exact behaviour, including how every ambiguous case is resolved, is pinned by
-shared conformance fixtures (spec v2) that the TypeScript port (calas-gateway)
+shared conformance fixtures (spec v3) that the TypeScript port (calas-gateway)
 runs too.
 
 ## Safety rules (load-bearing)

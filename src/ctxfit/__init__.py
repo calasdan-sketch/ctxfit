@@ -25,6 +25,7 @@ from .notes import (
     mask_observations,
     openai_summarizer,
     plan_context,
+    recall_tool,
     scrub_secrets,
 )
 from .pipeline import FitPipeline, FitReport, PairingBroken, fit
@@ -39,7 +40,7 @@ from .strategies import (
     TruncateToolOutput,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Budget",
@@ -78,6 +79,7 @@ __all__ = [
     "normalize",
     "openai_summarizer",
     "plan_context",
+    "recall_tool",
     "scrub_secrets",
     "validate_pairing",
 ]

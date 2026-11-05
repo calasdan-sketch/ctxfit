@@ -669,13 +669,15 @@ def test_state_round_trip_through_json():
 def test_load_state_rejects_bad_input():
     k = keeper()
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-2", "cut_turn": -1})
+        k.load_state({"version": 2, "algo": "rn-3", "cut_turn": -1})
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-2", "failures": True})
+        k.load_state({"version": 2, "algo": "rn-3", "failures": True})
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-2", "cut_turn": 3, "notes": None, "prefix_hash": "x"})
+        k.load_state(
+            {"version": 2, "algo": "rn-3", "cut_turn": 3, "notes": None, "prefix_hash": "x"}
+        )
     with pytest.raises(ValueError):
-        k.load_state({"version": 2, "algo": "rn-2", "notes": 5})
+        k.load_state({"version": 2, "algo": "rn-3", "notes": 5})
     with pytest.raises(ValueError):
         k.load_state("nope")  # type: ignore[arg-type]
 
@@ -689,7 +691,7 @@ def test_state_dict_fields():
         "summariser_calls", "summariser_input_tokens", "summariser_output_tokens", "updated_at",
         "algo", "failures", "retry_at_turn",
     }  # fmt: skip
-    assert st["version"] == 2 and st["algo"] == "rn-2"
+    assert st["version"] == 2 and st["algo"] == "rn-3"
     assert st["updated_at"] == "2026-11-05T00:00:00"
     assert len(st["prefix_hash"]) == 64
 
@@ -837,7 +839,7 @@ def test_top_level_exports():
     for name in ("mask_observations", "NotesKeeper", "NotesReport", "MaskReport",
                  "anthropic_summarizer", "openai_summarizer", "scrub_secrets"):  # fmt: skip
         assert hasattr(ctxfit, name)
-    assert ctxfit.__version__ == "0.3.0"
+    assert ctxfit.__version__ == "0.4.0"
 
 
 # ---------------------------------------------------------------------------
