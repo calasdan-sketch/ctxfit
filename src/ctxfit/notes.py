@@ -177,6 +177,58 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?:.*[_-])?(?:" + _KV_KEYS + r"|authorization)", re.ASCII | re.IGNORECASE
+)
+
+
+def _scrub_value(value: Any, sensitive: bool = False) -> Any:
+    """Scrub a parsed JSON value before it is encoded for the summariser.
+
+    Every string is scrubbed as text; under a sensitive key (``password``,
+    ``api_key``, ``token``, ``db_password``, ``x-api-key``, ``authorization``,
+    ...) a string or number becomes ``[redacted]`` (lists inherit the key's
+    sensitivity, objects do not). Keys and their order are kept.
+    """
+    if isinstance(value, str):
+        return REDACTED if sensitive else scrub_secrets(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return REDACTED if sensitive else value
+    if isinstance(value, dict):
+        return {
+            k: _scrub_value(v, _SENSITIVE_KEY_RE.fullmatch(str(k)) is not None)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_scrub_value(v, sensitive) for v in value]
+    return value
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"not JSON: {name}")
+
+
+def _render_args(raw: Any, is_text: bool) -> str:
+    """Tool-call arguments for the summariser: values scrubbed before encoding, then the line.
+
+    ``is_text`` marks a string of arguments (OpenAI ``arguments``, generic
+    tool_call content): it is parsed as strict JSON and, when that gives an
+    object or array, re-encoded from the scrubbed value; otherwise it is used
+    as is. Anthropic ``input`` objects are encoded from the scrubbed value.
+    """
+    if is_text:
+        if not isinstance(raw, str):
+            return scrub_secrets(raw)
+        try:
+            parsed = json.loads(raw, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            return scrub_secrets(raw)
+        if not isinstance(parsed, (dict, list)):
+            return scrub_secrets(raw)
+        raw = parsed
+    return scrub_secrets(_json(_scrub_value(raw)))
+
+
 def _kv_sub(m: re.Match[str]) -> str:
     value = m.group(3)
     if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
@@ -302,13 +354,31 @@ def _json(obj: Any, sort_keys: bool = False) -> str:
     if isinstance(obj, str):
         return _json_str(obj)
     if isinstance(obj, dict):
-        keys = sorted(obj, key=str) if sort_keys else list(obj)
+        keys = sorted(obj, key=str) if sort_keys else _js_key_order(obj)
         return (
             "{" + ",".join(_json_str(str(k)) + ":" + _json(obj[k], sort_keys) for k in keys) + "}"
         )
     if isinstance(obj, (list, tuple)):
         return "[" + ",".join(_json(v, sort_keys) for v in obj) + "]"
     return _json_str(str(obj))
+
+
+_ARRAY_INDEX_RE = re.compile(r"0|[1-9][0-9]{0,9}", re.ASCII)
+_MAX_ARRAY_INDEX = 2**32 - 2
+
+
+def _is_array_index(key: str) -> bool:
+    return _ARRAY_INDEX_RE.fullmatch(key) is not None and int(key) <= _MAX_ARRAY_INDEX
+
+
+def _js_key_order(obj: dict[Any, Any]) -> list[Any]:
+    """Keys in JavaScript's own-property order: array-index keys ascending, then the rest in order."""
+    keys = list(obj)
+    idx = [k for k in keys if _is_array_index(str(k))]
+    if not idx:
+        return keys
+    idx.sort(key=lambda k: int(str(k)))
+    return idx + [k for k in keys if not _is_array_index(str(k))]
 
 
 def canonical_json(obj: Any) -> str:
@@ -396,6 +466,8 @@ class _View:
     results: list[tuple[str | None, str]]  # (call_id, original_text)
     pinned: bool = False
     turn: int = 0
+    # per call: (raw arguments, is_text) for rendering (see _render_args)
+    raw_args: list[tuple[Any, bool]] = field(default_factory=list)
 
 
 def _view_anthropic(i: int, m: dict[str, Any]) -> _View:
@@ -404,10 +476,12 @@ def _view_anthropic(i: int, m: dict[str, Any]) -> _View:
     text_parts: list[str] = []
     calls: list[tuple[str | None, str, str]] = []
     results: list[tuple[str | None, str]] = []
+    raw_args: list[tuple[Any, bool]] = []
     if isinstance(content, list):
         for b in content:
             btype = b.get("type") if isinstance(b, dict) else None
             if btype == "tool_use":
+                raw_args.append((b.get("input", {}), False))
                 name = b.get("name")
                 calls.append(
                     (
@@ -420,15 +494,16 @@ def _view_anthropic(i: int, m: dict[str, Any]) -> _View:
                 results.append((_id(b.get("tool_use_id")), _anthropic_result_text(b)))
             elif btype == "text":
                 text_parts.append(_text_of(b))
+            elif isinstance(b, str):
+                text_parts.append(b)  # a bare string item is text
             else:
                 text_parts.append(NON_TEXT)
         only_results = bool(content) and len(results) == len(content)
     else:
         text_parts.append(_content_text(content))
         only_results = False
-    return _View(
-        i, role, role == "user" and not only_results, "\n".join(text_parts), calls, results
-    )
+    starts = role == "user" and not only_results
+    return _View(i, role, starts, "\n".join(text_parts), calls, results, raw_args=raw_args)
 
 
 def _view_openai(i: int, m: dict[str, Any]) -> _View:
@@ -437,12 +512,17 @@ def _view_openai(i: int, m: dict[str, Any]) -> _View:
         text = _content_text(m.get("content"), _OPENAI_TEXT)
         return _View(i, role, False, "", [], [(_id(m.get("tool_call_id")), text)])
     calls: list[tuple[str | None, str, str]] = []
+    raw_args: list[tuple[Any, bool]] = []
     tcs = m.get("tool_calls")
     for tc in tcs if isinstance(tcs, list) else []:
         if not isinstance(tc, dict):
             continue
         fn = tc.get("function")
         fn = fn if isinstance(fn, dict) else {}
+        if "arguments" not in fn:
+            raw_args.append(("", True))
+        else:
+            raw_args.append((fn["arguments"], isinstance(fn["arguments"], str)))
         name = fn.get("name")
         calls.append(
             (
@@ -452,7 +532,7 @@ def _view_openai(i: int, m: dict[str, Any]) -> _View:
             )
         )
     text = _content_text(m.get("content"), _OPENAI_TEXT)
-    return _View(i, role, role == "user", text, calls, [])
+    return _View(i, role, role == "user", text, calls, [], raw_args=raw_args)
 
 
 def _view_generic(i: int, m: dict[str, Any]) -> _View:
@@ -471,6 +551,7 @@ def _view_generic(i: int, m: dict[str, Any]) -> _View:
             "",
             [(cid, name if isinstance(name, str) and name else "tool", content)],
             [],
+            raw_args=[(content, True)],
         )
     return _View(i, role, role == "user", content, [], [])
 
@@ -747,7 +828,9 @@ def _render(conv: _Conversation, indexes: Sequence[int]) -> str:
     """Render messages as plain text for the summariser (spec v2 A1 + B1).
 
     Per message: ``[{role}] {text}``, then ``[assistant -> {tool}] {args}``
-    per call (args capped at 500 chars), then
+    per call (args: every string value scrubbed, sensitive keys' values
+    redacted, then JSON-encoded and the line scrubbed again, capped at 500
+    chars), then
     ``[{tool} result - untrusted data]`` + newline + the result text (capped
     at 1,500 chars) per result. Each piece is scrubbed in full before it is
     capped; every line of an entry after its first is indented two spaces.
@@ -757,8 +840,9 @@ def _render(conv: _Conversation, indexes: Sequence[int]) -> str:
         v = conv.views[idx]
         if v.text:
             entries.append(f"[{v.role}] {scrub_secrets(v.text)}")
-        for _cid, name, args in v.calls:
-            entries.append(f"[assistant -> {name}] {scrub_secrets(args)[:RENDER_ARGS_MAX_CHARS]}")
+        for (_cid, name, _args), (raw, is_text) in zip(v.calls, v.raw_args):
+            args = _render_args(raw, is_text)[:RENDER_ARGS_MAX_CHARS]
+            entries.append(f"[assistant -> {name}] {args}")
         for rpos, (_cid, text) in enumerate(v.results):
             body = scrub_secrets(text)[:RENDER_RESULT_MAX_CHARS]
             entries.append(f"[{conv.tool_name(idx, rpos)} result - untrusted data]\n{body}")
@@ -815,8 +899,8 @@ class NotesConfig:
 
 
 def _check_mask_config(keep_recent_turns: int, mask_chunk_turns: int, min_mask_chars: int) -> None:
-    if keep_recent_turns < 0:
-        raise ValueError("keep_recent_turns must be >= 0")
+    if keep_recent_turns < 1:
+        raise ValueError("keep_recent_turns must be >= 1")
     if mask_chunk_turns < 1:
         raise ValueError("mask_chunk_turns must be >= 1")
     if min_mask_chars < 0:

@@ -269,8 +269,10 @@ are removed and secrets scrubbed. This lowers the risk; it does not remove it
   the summariser: PEM private keys (also unterminated), `sk-`/`sk-ant-`/
   `sk-proj-` keys, Stripe, AWS, GitHub, GitLab, Slack, Google and Hugging Face
   tokens, JWTs, `Bearer` tokens, `user:pass@` in URLs and `password: …` /
-  `api_key=…` style values (the key name is kept). Previous notes and the
-  summariser's answer are scrubbed too.
+  `api_key=…` style values (the key name is kept). Tool-call arguments are
+  scrubbed value by value before they are encoded, and values under keys
+  like `password`, `api_key` or `db_token` are replaced outright. Previous
+  notes and the summariser's answer are scrubbed too.
 - **Provider-managed context is left alone.** If the request uses
   `context_management`, or carries thinking/compaction/server-tool blocks,
   ctxfit returns it unchanged (`provider_context`); pass `force=True` to

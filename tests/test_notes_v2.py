@@ -916,3 +916,76 @@ def test_cli_mask_offload_report_is_owner_only(tmp_path):
     assert main(["mask", str(src), "--report", str(rep), "--offload"]) == 0
     assert stat.S_IMODE(os.stat(rep).st_mode) == 0o600
     assert len(json.loads(rep.read_text())["offload"]) == 4
+
+
+# ---------------------------------------------------------------------------
+# differential-fuzz findings
+# ---------------------------------------------------------------------------
+
+
+def test_integer_like_keys_follow_javascript_order():
+    obj = {"b": 1, "10": 2, "2": 3, "01": 4, "-1": 5, "4294967295": 6, "4294967294": 7}
+    assert _json(obj) == '{"2":3,"10":2,"4294967294":7,"b":1,"01":4,"-1":5,"4294967295":6}'
+    assert canonical_json(obj).startswith('{"-1":5,"01":4,"10":2')  # hashes: code-point sort
+    from ctxfit.notes import _message_chars
+
+    m = {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "t", "input": {"b": 1, "10": 2}}],
+    }
+    assert _message_chars("anthropic", m) == len('{"10":2,"b":1}')
+
+
+def _rendered_args(msgs):
+    s = FakeSummarizer("n")
+    keeper(s).fit(msgs)
+    return s.calls[0][1]
+
+
+def test_tool_args_are_scrubbed_value_by_value():
+    msgs = anthropic_convo(10)
+    msgs[1]["content"][1]["input"] = {
+        "command": 'export TOKEN="abc123 def456ghi"',
+        "h": "Authorization: Bearer\tabcdefghijklmnop",
+        "api_key": '"QWERTYUIOPasdfgh"',
+        "db_password": 123456,
+        "max_tokens": 3000,
+    }
+    user = _rendered_args(msgs)
+    for leak in ("def456ghi", "abc123", "abcdefghijklmnop", "QWERTY", "123456"):
+        assert leak not in user
+    assert '"max_tokens":3000' in user
+    o = openai_convo(10)
+    o[2]["tool_calls"][0]["function"]["arguments"] = json.dumps(
+        {"cmd": 'export TOKEN="abc123 def456ghi"', "secret": 42}
+    )
+    user = _rendered_args(o)
+    assert "def456ghi" not in user and "42" not in user
+
+
+def test_scrub_value_rules():
+    from ctxfit.notes import _scrub_value
+
+    v = {"x-api-key": 1, "list": ["sk-ant-api03-AAAABBBBCCCCDDDDEEEE"], "token": [True, "a", 2],
+         "secret": {"inner": "ok"}, "tokens": "keep"}  # fmt: skip
+    assert _scrub_value(v) == {
+        "x-api-key": "[redacted]", "list": ["[redacted]"], "token": [True, "[redacted]", "[redacted]"],
+        "secret": {"inner": "ok"}, "tokens": "keep",
+    }  # fmt: skip
+
+
+def test_bare_string_item_is_text_for_pins_and_rendering():
+    msgs = anthropic_convo(10)
+    msgs[12]["content"] = ["[pin] bare rule", {"type": "text", "text": "next step 3"}]
+    msgs[11]["content"] = ["bare reply"]
+    s = FakeSummarizer("n")
+    out, _ = keeper(s).fit(msgs)
+    assert msgs[12] in out and "bare rule" not in s.calls[0][1]
+    assert "[assistant] bare reply" in s.calls[0][1]
+
+
+def test_keep_recent_turns_minimum_is_one():
+    with pytest.raises(ValueError):
+        NotesConfig(keep_recent_turns=0)
+    with pytest.raises(ValueError):
+        mask_observations([], keep_recent_turns=0)
