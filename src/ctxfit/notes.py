@@ -576,7 +576,8 @@ class _Conversation:
         for v in self.views:
             if v.starts_turn:
                 turn += 1
-                if first_user is None:
+                # The task statement: the first turn start with non-blank own text.
+                if first_user is None and not _is_blank(v.text):
                     first_user = v.index
                 self.turn_start.setdefault(turn, v.index)
             v.turn = max(turn, 0)

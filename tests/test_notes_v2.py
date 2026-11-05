@@ -989,3 +989,15 @@ def test_keep_recent_turns_minimum_is_one():
         NotesConfig(keep_recent_turns=0)
     with pytest.raises(ValueError):
         mask_observations([], keep_recent_turns=0)
+
+
+def test_blank_first_user_message_is_not_the_task():
+    msgs = [{"role": "user", "content": []}, {"role": "assistant", "content": "?"}]
+    msgs += anthropic_convo(10)
+    s = FakeSummarizer("n")
+    out, r = keeper(s).fit(msgs)
+    assert r.turns == 11  # turn numbering unchanged
+    assert msgs[2] in out and "Task: fix the build" not in s.calls[0][1]
+    assert msgs[0] not in out
+    plan = plan_context([{"role": "user", "content": " \n"}], config=CFG)
+    assert not plan.conv.views[0].pinned  # no non-blank user message: nothing pinned
