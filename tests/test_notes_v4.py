@@ -24,7 +24,7 @@ from ctxfit.notes import (
 
 
 def test_algo_and_config_validation():
-    assert ALGO == "rn-5"
+    assert ALGO == "rn-6"
     assert NotesConfig().keep_facts is True and NotesConfig().max_index == 20
     for bad in (
         dict(clear_at_least_chars="sometimes"),

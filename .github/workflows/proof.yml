@@ -1,0 +1,32 @@
+name: proof
+on:
+  push:
+  pull_request:
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests benchmarks
+      - run: pytest -q
+      # The published numbers must match the code that produces them.
+      - run: python benchmarks/running_notes_bench.py --check
+      # The demo replay is the committed one, byte for byte.
+      - run: ctxfit replay src/ctxfit/demo --json --redact > /tmp/demo-replay.json
+      - run: diff -u docs/demo-replay.json /tmp/demo-replay.json
+      - run: ctxfit badge --out savings.json
+      # Regenerate the demo GIF from the tape (no checked-in GIF can go stale).
+      - uses: charmbracelet/vhs-action@v2
+        with:
+          path: scripts/demo.tape
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proof
+          path: |
+            docs/demo.gif
+            savings.json

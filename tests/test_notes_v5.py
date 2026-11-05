@@ -45,7 +45,7 @@ def _results(msgs):
 
 
 def test_algo_and_config():
-    assert ALGO == "rn-5"
+    assert ALGO == "rn-6"
     with pytest.raises(ValueError):
         NotesConfig(arrival="lossy")
     with pytest.raises(ValueError):

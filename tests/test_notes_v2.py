@@ -82,6 +82,7 @@ def _run_step(data, step, state):
         context_management=step.get("context_management"),
         force=step.get("force", False),
         now=step.get("now", DEFAULT_NOW),
+        previous_response_id=step.get("previous_response_id"),
     )
     calls = []
     if plan.summary is not None:
@@ -93,7 +94,7 @@ def _run_step(data, step, state):
 @pytest.mark.parametrize("path", fixture_files("case"), ids=lambda p: p.stem)
 def test_fixture_case(path):
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["spec_version"] == 5 and data["generator"] == f"ctxfit {ctxfit.__version__}"
+    assert data["spec_version"] == 6 and data["generator"] == f"ctxfit {ctxfit.__version__}"
     notes = data["fake_notes_text"]
     step = {
         "input_messages": data["input_messages"],
@@ -117,7 +118,7 @@ def test_fixture_case(path):
 @pytest.mark.parametrize("path", fixture_files("scenario"), ids=lambda p: p.stem)
 def test_fixture_scenario(path):
     data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["spec_version"] == 5 and data["generator"] == f"ctxfit {ctxfit.__version__}"
+    assert data["spec_version"] == 6 and data["generator"] == f"ctxfit {ctxfit.__version__}"
     state = None
     for i, step in enumerate(data["steps"]):
         res, calls = _run_step(data, step, state)
@@ -172,6 +173,7 @@ def test_fixture_scenario_through_keeper(path):
             system=data.get("system"),
             context_management=step.get("context_management"),
             force=step.get("force", False),
+            previous_response_id=step.get("previous_response_id"),
         )
         assert out == step["expected_output_messages"], i
         want = step["expected_report_subset"]
@@ -184,7 +186,7 @@ def test_fixture_scenario_through_keeper(path):
 @needs_fixtures
 def test_fixture_scrubber():
     data = json.loads((FIXTURES / "scrubber-01-patterns.json").read_text(encoding="utf-8"))
-    assert data["spec_version"] == 5
+    assert data["spec_version"] == 6
     for case in data["cases"]:
         assert scrub_secrets(case["input"]) == case["expected"]
 

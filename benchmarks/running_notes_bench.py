@@ -1,6 +1,7 @@
 """Replay synthetic agent transcripts through ctxfit running notes and report honest numbers.
 
     python benchmarks/running_notes_bench.py            # print + write benchmarks/RESULTS.md
+    python benchmarks/running_notes_bench.py --check    # exit 1 if RESULTS.md drifted (CI)
 
 Everything here is SYNTHETIC and deterministic (fixed seeds): the transcripts are
 generated, not recorded, and the "summariser" is a fake that returns a fixed-size
@@ -462,6 +463,13 @@ def main() -> int:
         "",
     ]
     text = "\n".join(lines)
+    if "--check" in sys.argv[1:]:
+        current = (HERE / "RESULTS.md").read_text(encoding="utf-8")
+        if current != text:
+            print("benchmarks/RESULTS.md is out of date: run the benchmark", file=sys.stderr)
+            return 1
+        print("benchmarks/RESULTS.md is up to date")
+        return 0
     (HERE / "RESULTS.md").write_text(text, encoding="utf-8")
     print(text)
     return 0

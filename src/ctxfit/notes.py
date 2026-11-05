@@ -87,7 +87,7 @@ from .messages import Message, detect_flavor
 # ---------------------------------------------------------------------------
 
 STATE_VERSION = 2
-ALGO = "rn-5"
+ALGO = "rn-6"
 MAX_MESSAGES = 5_000
 MAX_JSON_DEPTH = 256
 """Tool output / arguments nested deeper than this are not treated as JSON."""
@@ -518,6 +518,8 @@ class _View:
     turn: int = 0
     # per call: (raw arguments, is_text) for rendering (see _render_args)
     raw_args: list[tuple[Any, bool]] = field(default_factory=list)
+    # Responses API items that must pass through untouched (reasoning, compaction, ...)
+    fixed: bool = False
 
 
 def _view_anthropic(i: int, m: dict[str, Any]) -> _View:
@@ -606,7 +608,59 @@ def _view_generic(i: int, m: dict[str, Any]) -> _View:
     return _View(i, role, role == "user", content, [], [])
 
 
-_VIEWERS = {"anthropic": _view_anthropic, "openai": _view_openai, "generic": _view_generic}
+RESPONSES_TEXT = ("input_text", "output_text", "text")
+RESPONSES_CALLS = ("function_call", "custom_tool_call")
+RESPONSES_OUTPUTS = ("function_call_output", "custom_tool_call_output")
+RESPONSES_TYPES = frozenset(
+    {"message", "reasoning", "compaction", "item_reference", *RESPONSES_CALLS, *RESPONSES_OUTPUTS}
+)
+
+
+def _responses_output_text(item: dict[str, Any]) -> str:
+    return _content_text(item.get("output", ""), RESPONSES_TEXT)
+
+
+def _view_responses(i: int, m: dict[str, Any]) -> _View:
+    """One Responses API input item (spec v6 #6)."""
+    itype = m.get("type")
+    if itype is None and "role" in m:
+        itype = "message"
+    if itype == "message" and "encrypted_content" not in m:
+        role = _role(m)
+        text = _content_text(m.get("content"), RESPONSES_TEXT)
+        return _View(i, role, role == "user", text, [], [])
+    if itype in RESPONSES_CALLS and "encrypted_content" not in m:
+        name = m.get("name")
+        key = "arguments" if itype == "function_call" else "input"
+        if key in m:
+            raw = m[key]
+            args = raw if isinstance(raw, str) else _json(raw)
+            raw_args = [(raw, isinstance(raw, str))]
+        else:
+            args, raw_args = "", [("", True)]
+        call = (_id(m.get("call_id")), name if isinstance(name, str) and name else "tool", args)
+        return _View(i, "assistant", False, "", [call], [], raw_args=raw_args)
+    if itype in RESPONSES_OUTPUTS and "encrypted_content" not in m:
+        result = (_id(m.get("call_id")), _responses_output_text(m))
+        return _View(i, "tool", False, "", [], [result])
+    # reasoning, compaction, item_reference, server-side tool items, anything encrypted:
+    # passed through byte for byte. Never masked; pinned (never evicted) except a
+    # reasoning item, which goes with the item right after it.
+    role = itype if isinstance(itype, str) else "item"
+    return _View(i, role, False, "", [], [], fixed=True)
+
+
+_VIEWERS = {
+    "anthropic": _view_anthropic,
+    "openai": _view_openai,
+    "generic": _view_generic,
+    "responses": _view_responses,
+}
+
+
+def _result_key(flavor: str) -> str:
+    """Where a tool output lives in its message/item."""
+    return "output" if flavor == "responses" else "content"
 
 
 class _Conversation:
@@ -634,7 +688,8 @@ class _Conversation:
         self.turn_count = (turn + 1) if turn >= 0 else (1 if raw else 0)
         for v, m in zip(self.views, raw):
             v.pinned = (
-                v.role in ("system", "developer")
+                (v.fixed and v.role != "reasoning")
+                or v.role in ("system", "developer")
                 or m.get("pinned") is True
                 or v.index == first_user
                 or (v.role in PIN_ROLES and bool(_PIN_RE.search(v.text)))
@@ -668,6 +723,9 @@ class _Conversation:
                     pending.setdefault(cid, []).append((v.index, cpos))
                 elif flavor != "openai" and v.index + 1 < n:
                     self._pair(v.index, v.index + 1)
+            if v.fixed and v.role == "reasoning" and v.index + 1 < n:
+                # A reasoning item belongs to the item right after it (spec v6 #6).
+                self._pair(v.index, v.index + 1)
         if flavor == "openai":
             for v in self.views:
                 if any(cid is None for cid, _n, _a in v.calls):
@@ -762,8 +820,39 @@ class _Conversation:
         return cum
 
 
+def _responses_chars(m: dict[str, Any]) -> int:
+    itype = m.get("type")
+    if itype is None and "role" in m:
+        itype = "message"
+    if "encrypted_content" in m:
+        return len(NON_TEXT)
+    if itype == "message":
+        content = m.get("content")
+        if isinstance(content, list):
+            return sum(
+                _clen(_text_of(b))
+                if isinstance(b, dict) and b.get("type") in RESPONSES_TEXT
+                else _clen(b)
+                if isinstance(b, str)
+                else len(NON_TEXT)
+                for b in content
+            )
+        return _clen(_content_text(content, RESPONSES_TEXT))
+    if itype in RESPONSES_CALLS:
+        key = "arguments" if itype == "function_call" else "input"
+        if key not in m:
+            return 0
+        raw = m[key]
+        return _clen(raw if isinstance(raw, str) else _json(raw))
+    if itype in RESPONSES_OUTPUTS:
+        return _clen(_responses_output_text(m))
+    return len(NON_TEXT)
+
+
 def _message_chars(flavor: str, m: dict[str, Any]) -> int:
     """Code-point length of a raw message's content (the estimate basis)."""
+    if flavor == "responses":
+        return _responses_chars(m)
     content = m.get("content")
     total = 0
     if isinstance(content, str):
@@ -1290,7 +1379,7 @@ class _Masked:
 def _eligible_outputs(conv: _Conversation, cfg: NotesConfig) -> list[tuple[int, int, int, str]]:
     """(message index, result position, turn, text) of every output masking may replace."""
     out: list[tuple[int, int, int, str]] = []
-    excluded = set(cfg.exclude_tools)
+    excluded = set(cfg.exclude_tools) | set(cfg.anchor_tools)
     for v in conv.views:
         if v.pinned or not v.results:
             continue
@@ -1346,15 +1435,15 @@ def _choose_boundary(
 _TEXT_PART_TYPES = ("text", "input_text")
 
 
-def _text_only(content: Any) -> bool:
+def _text_only(content: Any, flavor: str = "anthropic") -> bool:
     """A tool output made only of text (string, or a list of text parts / strings)."""
     if isinstance(content, str):
         return True
     if not isinstance(content, list):
         return content is None
+    types = RESPONSES_TEXT if flavor == "responses" else _TEXT_PART_TYPES
     return all(
-        isinstance(p, str) or (isinstance(p, dict) and p.get("type") in _TEXT_PART_TYPES)
-        for p in content
+        isinstance(p, str) or (isinstance(p, dict) and p.get("type") in types) for p in content
     )
 
 
@@ -1422,20 +1511,22 @@ def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = No
     recent = cfg.squeeze_recent_json and cfg.mask_style == "squeeze"
     eligible = {(idx, rpos) for idx, rpos, _t, _x in _eligible_outputs(conv, cfg)}
     excluded = set(cfg.exclude_tools)
+    anchors = set(cfg.anchor_tools)
 
     def decide(idx: int, rpos: int, text: str, content: Any) -> str | None:
         """New content text for this output, or None to leave it as it is."""
         v = conv.views[idx]
         tool = conv.tool_name(idx, rpos)
-        text_only = _text_only(content)
+        text_only = _text_only(content, conv.flavor)
         dup_ok = text_only and not v.pinned and tool not in excluded
+        anchor = tool in anchors  # spec v6 #3: only the exact-duplicate transform
         if (idx, rpos) in eligible and v.turn < b:
             new, id8, kind = _replacement(cfg, tool, text)
             masked.squeeze_failed = masked.squeeze_failed or kind == "failed"
             masked.masked_at.setdefault(idx, []).append((id8, text, kind))
             masked.outputs[(idx, rpos)] = (text, "masked", text_only, dup_ok, None)
             return new
-        if cfg.arrival == "lossless" and dup_ok:
+        if cfg.arrival == "lossless" and dup_ok and not anchor:
             got = arrival_form(text)
             if got is not None:
                 masked.outputs[(idx, rpos)] = (text, "arrival", text_only, dup_ok, got[0])
@@ -1472,15 +1563,23 @@ def _apply_mask(conv: _Conversation, cfg: NotesConfig, boundary: int | None = No
                 new_blocks.append(blk)
             m["content"] = new_blocks
         else:
-            new = decide(idx, 0, v.results[0][1], m.get("content"))
+            key = _result_key(conv.flavor)
+            new = decide(idx, 0, v.results[0][1], m.get(key))
             if new is not None:
-                _set_result(m, "content", new)
+                _set_result(m, key, new)
     return masked
 
 
 def _set_result(holder: dict[str, Any], key: str, new: str) -> None:
-    """A content list becomes one text block; anything else becomes the string."""
-    holder[key] = [{"type": "text", "text": new}] if isinstance(holder.get(key), list) else new
+    """A content list becomes one text block; anything else becomes the string.
+
+    (A Responses ``output`` list becomes one ``input_text`` part.)
+    """
+    if isinstance(holder.get(key), list):
+        part = "input_text" if key == "output" else "text"
+        holder[key] = [{"type": part, "text": new}]
+    else:
+        holder[key] = new
 
 
 def _apply_duplicates(
@@ -1522,7 +1621,7 @@ def _apply_duplicates(
             if dup_ok and arrival_on and text in seen:
                 ref = DUPLICATE_MARKER.format(id8=_sha256(text)[:8])
                 if _fits(ref, text, ARRIVAL_MAX_RATIO_NUM, ARRIVAL_MAX_RATIO_DEN):
-                    _set_result(holder, "content", ref)
+                    _set_result(holder, _result_key(conv.flavor), ref)
                     present.append((text, ref, "duplicate"))
                     continue
             if text_only:
@@ -1646,11 +1745,17 @@ class NotesConfig:
     expected_reuse: float = 4
     arrival: str = "off"
     cache_ttl_seconds: float | None = 300
+    anchor_tools: tuple[str, ...] = ("Read", "NotebookRead", "Grep")
 
     def __post_init__(self) -> None:
         special = {"exclude_tools", "mask_style", "clear_at_least_chars", "keep_facts",
                    "squeeze_recent_json", "cache_write_multiplier", "cache_read_multiplier",
-                   "expected_reuse", "arrival", "cache_ttl_seconds"}  # fmt: skip
+                   "expected_reuse", "arrival", "cache_ttl_seconds",
+                   "anchor_tools"}  # fmt: skip
+        anchors = self.anchor_tools
+        if isinstance(anchors, str) or not all(isinstance(t, str) for t in anchors):
+            raise ValueError("anchor_tools must be a list of tool names")
+        object.__setattr__(self, "anchor_tools", tuple(anchors))
         if self.arrival not in ARRIVAL_MODES:
             raise ValueError("arrival must be 'off' or 'lossless'")
         ttl = self.cache_ttl_seconds
@@ -1906,7 +2011,11 @@ class MaskReport:
             f"  masked {self.masked_outputs} tool output(s), {self.masked_chars:,} chars"
             + (f" ({self.squeezed_outputs} squeezed)" if self.squeezed_outputs else ""),
         ]
-        skipped = [r for r in self.reasons if r in ("provider_context", "too_many_messages")]
+        skipped = [
+            r
+            for r in self.reasons
+            if r in ("provider_context", "too_many_messages", "too_deep", "previous_response_id")
+        ]
         if skipped:
             lines.append(f"  skipped: {skipped[0]}")
         return "\n".join(lines)
@@ -2089,10 +2198,12 @@ def _resolve_flavor(
         if flavor != "generic":
             raise ValueError("Message objects are processed in the 'generic' flavor")
     if flavor == "auto":
-        flavor = detect_flavor(items)
+        typed = any(isinstance(m, dict) and m.get("type") in RESPONSES_TYPES for m in items)
+        flavor = "responses" if typed else detect_flavor(items)
     if flavor not in _VIEWERS:
         raise ValueError(
-            f"running notes support flavors 'anthropic', 'openai' and 'generic' (got {flavor!r})"
+            "running notes support flavors 'anthropic', 'openai', 'responses' and 'generic' "
+            f"(got {flavor!r})"
         )
     for i, m in enumerate(items):
         if not isinstance(m, dict):
@@ -2248,6 +2359,7 @@ def plan_context(
     context_management: Any = None,
     force: bool = False,
     now: str | float | None = None,
+    previous_response_id: Any = None,
 ) -> ContextPlan:
     """Phase one: masking, whether the stored state applies, and where the cut moves.
 
@@ -2304,6 +2416,10 @@ def plan_context(
         return plan
     if _too_deep(raw, MAX_INPUT_DEPTH):
         plan.skip = "too_deep"
+        return plan
+    if previous_response_id is not None:
+        # Responses API with server-side history: the input is only the new part.
+        plan.skip = "previous_response_id"
         return plan
     if not force and _provider_context(fl, raw, context_management):
         plan.skip = "provider_context"
@@ -2436,6 +2552,8 @@ def _assemble(
     else:
         if conv.flavor == "anthropic":
             out.append({"role": "user", "content": [{"type": "text", "text": text}]})
+        elif conv.flavor == "responses":
+            out.append({"type": "message", "role": "user", "content": text})
         else:
             out.append({"role": "user", "content": text})
         origins.append(None)
@@ -2635,6 +2753,7 @@ def mask_observations(
     keep_facts: bool = True,
     squeeze_recent_json: bool = False,
     arrival: str = "off",
+    previous_response_id: Any = None,
 ) -> tuple[list[Any], MaskReport]:
     """Layer 1: hide (or squeeze) old tool outputs behind a deterministic marker.
 
@@ -2676,6 +2795,7 @@ def mask_observations(
         config=cfg,
         context_management=context_management,
         force=force,
+        previous_response_id=previous_response_id,
     )
     res = finish_context(plan, None)
     r = res.report
@@ -3062,6 +3182,7 @@ class NotesKeeper:
         *,
         context_management: Any = None,
         force: bool = False,
+        previous_response_id: Any = None,
     ) -> tuple[list[Any], NotesReport]:
         """Apply masking + running notes to the full original history.
 
@@ -3069,12 +3190,15 @@ class NotesKeeper:
             raw_messages: the ``messages`` array (Anthropic or OpenAI shape,
                 generic dicts, or ctxfit ``Message`` objects, which come back
                 as ``Message`` objects with their ``meta`` kept).
-            flavor: "auto" | "anthropic" | "openai" | "generic".
+            flavor: "auto" | "anthropic" | "openai" | "responses" | "generic"
+                ("responses" = the ``input`` items of an OpenAI Responses API body).
             system: Anthropic top-level ``system`` (string or blocks). Counted
                 in the estimates as pinned content; never altered or returned.
             context_management: the request body's ``context_management``
                 field, if any (then the request is left alone).
             force: rewrite even with provider-native context management.
+            previous_response_id: the Responses body's ``previous_response_id``;
+                when set the request is left alone (the history lives server-side).
 
         Returns ``(messages_in_original_shape, NotesReport)``. Never raises
         because of the summariser; input is never mutated. Synchronous.
@@ -3089,6 +3213,7 @@ class NotesKeeper:
             context_management=context_management,
             force=force,
             now=_clock_epoch(self._clock()),
+            previous_response_id=previous_response_id,
         )
         outcome = None
         if plan.summary is not None:
@@ -3108,6 +3233,7 @@ class NotesKeeper:
         *,
         context_management: Any = None,
         force: bool = False,
+        previous_response_id: Any = None,
     ) -> tuple[list[Any], NotesReport]:
         """:meth:`fit` in a worker thread, for asyncio code. Same arguments and result."""
         return await asyncio.to_thread(
@@ -3117,6 +3243,7 @@ class NotesKeeper:
             system,
             context_management=context_management,
             force=force,
+            previous_response_id=previous_response_id,
         )
 
     def _remember(self, id8: str, text: str, report: NotesReport) -> None:

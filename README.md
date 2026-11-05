@@ -153,7 +153,7 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
-## Running notes (opt-in, 0.6.0)
+## Running notes (opt-in, 0.7.0)
 
 Long agent runs re-send the whole conversation every turn. Most of that is old
 tool output nobody will read again. `ctxfit.notes` cuts it down, all of it off
@@ -268,7 +268,42 @@ CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
   (`cache_write_multiplier=1.25`, `cache_read_multiplier=0.1`) and how many
   more requests you expect to reuse the prefix (`expected_reuse=4`).
 
-**Changed in 0.6.0** (state from 0.5.0 is discarded once, `spec_changed`):
+**New in 0.7.0** (state from 0.6.0 is discarded once, `spec_changed`):
+
+- **Check it on your own history first: `ctxfit replay`.** Reads Claude
+  Code's local transcripts (`~/.claude/projects/**/*.jsonl`, or paths you
+  give, `--since 2026-11-01`), rebuilds every request, prices what was
+  really recorded, and shows what each strategy would have cost with prompt
+  caching, how often a hidden output was fetched again, and whether any
+  file read was altered. Nothing leaves your machine; `--redact` prints
+  numbers only; `--json` prints the exact report the TypeScript gateway's
+  `calas-gateway replay` also prints. The system prompt and tools are not in
+  the files, so their size is estimated from the first request's recorded
+  tokens (the report says so), and the simulation is checked against the
+  recorded bill (`calibration_off` if it misses by more than 5%). Running
+  notes are not simulated (they need a summariser).
+- **Anchor tools.** Outputs the model may copy from verbatim — `Read`,
+  `NotebookRead`, `Grep` by default (`anchor_tools=`) — are never hidden,
+  squeezed or reshaped; only an exact repeat of one may become a
+  reference to the earlier copy.
+- **OpenAI Responses API** (`flavor="responses"`, the body's `input`):
+  `function_call_output` items are masked and compacted like tool results;
+  reasoning, compaction and anything encrypted pass through untouched;
+  requests with `previous_response_id` are left alone.
+- **`ctxfit eval`** checks whether a strategy keeps what the model needs:
+  at a few checkpoints per conversation it blanks a fact (a path, code,
+  version, id) out of an output at least 8 turns old and asks a cheap model
+  to fill it in, with the full context and with the strategy's context
+  (`--judge` adds open recall/artifact/next-step/decision questions graded
+  by the model). It prints an estimated price first and will not run
+  without `--max-usd`; `--batch` uses the Message Batches API at half price.
+- **Proof kit**: `ctxfit badge --out savings.json` (a shields.io endpoint
+  computed only from the bundled synthetic demo corpus), `scripts/demo.tape`
+  (vhs recording of a replay; the GIF is built in CI, not committed), and a
+  CI job that fails when `benchmarks/RESULTS.md` or `docs/demo-replay.json`
+  no longer match the code.
+
+**Changed in 0.6.0**:
 
 - `arrival="lossless"` (see above; off by default, recommended).
 - **Cold-cache moments.** ctxfit remembers when the last request went out

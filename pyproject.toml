@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ctxfit"
-version = "0.6.0"
+version = "0.7.0"
 description = "Drop-in context-window optimizer for any agent loop: structural compression, section budgets, framework adapters"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,9 @@ Homepage = "https://calasautomations.com"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+ctxfit = ["prices.json", "demo/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

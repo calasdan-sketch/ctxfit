@@ -23,7 +23,7 @@ from ctxfit.notes import (
 
 
 def test_algo_is_rn3_and_old_states_are_spec_changed():
-    assert ALGO == "rn-5"
+    assert ALGO == "rn-6"
     plan = plan_context(anthropic_convo(4), state={"version": 2, "algo": "rn-2"})
     assert "spec_changed" in plan.reasons
 

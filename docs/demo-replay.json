@@ -1,0 +1,104 @@
+{
+  "replay": 1,
+  "algo": "rn-6",
+  "prices_as_of": "2026-10-16",
+  "corpus": {
+    "files": 3,
+    "entries": 88,
+    "skipped_lines": 1,
+    "sessions": 3,
+    "conversations": 4,
+    "sidechain_conversations": 1,
+    "compaction_segments": 1,
+    "requests": 41,
+    "unpriced_requests": 1
+  },
+  "hidden_prefix": {
+    "method": "per conversation: the first request's recorded prompt tokens (input + cache read + cache write) minus the estimated messages, at least 0",
+    "tokens_total": 13420
+  },
+  "baseline": {
+    "recorded_cost_micro_usd": 263030,
+    "simulated_none_micro_usd": 262533,
+    "calibration_bp": 9981,
+    "calibration_off": false
+  },
+  "strategies": [
+    {
+      "name": "none",
+      "requests": 41,
+      "sent_tokens_est": 245736,
+      "net_saved_bp": 0,
+      "cost_micro_usd": 263030,
+      "cost_vs_baseline_bp": 10000,
+      "cache_stable_bp": 9730,
+      "last_request_tokens_avg": 6134,
+      "facts_visible_bp": 10000,
+      "refetches": 9,
+      "refetch_after_hide": 0,
+      "anchor_touched": 0,
+      "summariser_calls": 0
+    },
+    {
+      "name": "arrival",
+      "requests": 41,
+      "sent_tokens_est": 212121,
+      "net_saved_bp": 1368,
+      "cost_micro_usd": 230050,
+      "cost_vs_baseline_bp": 8746,
+      "cache_stable_bp": 9730,
+      "last_request_tokens_avg": 5265,
+      "facts_visible_bp": 10000,
+      "refetches": 9,
+      "refetch_after_hide": 0,
+      "anchor_touched": 0,
+      "summariser_calls": 0
+    },
+    {
+      "name": "mask",
+      "requests": 41,
+      "sent_tokens_est": 237152,
+      "net_saved_bp": 349,
+      "cost_micro_usd": 264864,
+      "cost_vs_baseline_bp": 10070,
+      "cache_stable_bp": 9459,
+      "last_request_tokens_avg": 5895,
+      "facts_visible_bp": 8708,
+      "refetches": 9,
+      "refetch_after_hide": 0,
+      "anchor_touched": 0,
+      "summariser_calls": 0
+    },
+    {
+      "name": "mask+arrival",
+      "requests": 41,
+      "sent_tokens_est": 206730,
+      "net_saved_bp": 1587,
+      "cost_micro_usd": 228571,
+      "cost_vs_baseline_bp": 8690,
+      "cache_stable_bp": 9459,
+      "last_request_tokens_avg": 5115,
+      "facts_visible_bp": 8708,
+      "refetches": 9,
+      "refetch_after_hide": 0,
+      "anchor_touched": 0,
+      "summariser_calls": 0
+    },
+    {
+      "name": "mask+clear20k+arrival",
+      "requests": 41,
+      "sent_tokens_est": 208527,
+      "net_saved_bp": 1514,
+      "cost_micro_usd": 226899,
+      "cost_vs_baseline_bp": 8626,
+      "cache_stable_bp": 9730,
+      "last_request_tokens_avg": 5115,
+      "facts_visible_bp": 8708,
+      "refetches": 9,
+      "refetch_after_hide": 0,
+      "anchor_touched": 0,
+      "summariser_calls": 0
+    }
+  ],
+  "notes": "running notes are not simulated (they need a summariser model)"
+}
