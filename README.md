@@ -7,7 +7,7 @@ result sits uncompressed in context for the rest of the run.
 
 **ctxfit** is the standalone layer every agent team hand-rolls and nobody
 ships: structural context compression with budget enforcement. No LLM calls,
-no framework lock-in, deterministic.
+no framework lock-in, deterministic. Opt-in running notes for long agent runs.
 
 ```python
 import ctxfit
@@ -153,6 +153,320 @@ System messages are pinned automatically. Pin anything that must survive:
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
 
+## Running notes (opt-in, 0.7.0)
+
+Long agent runs re-send the whole conversation every turn. Most of that is old
+tool output nobody will read again. `ctxfit.notes` cuts it down, all of it off
+unless you call it.
+
+**What saves real money if your provider caches prompts** (Claude, OpenAI):
+a cached prefix is already 10x cheaper, and rewriting old history makes you
+pay to cache it again. So, in order:
+
+1. **`arrival="lossless"`** — compacts each tool output once, when it first
+   arrives, without losing anything: a repeat of an output the model can
+   still see becomes `[ctxfit: identical to earlier output id 3f9a1c07]`, flat
+   JSON arrays become tables, runs of identical lines become `line  [x12]`.
+   The same output always gets the same form, so the prompt cache is never
+   broken. In our synthetic benchmark this alone cost 52-79% of doing nothing,
+   with every fact still visible (most of it from repeated file and page
+   reads; your agent may repeat less).
+2. **Masking with `clear_at_least_chars`** (e.g. 20,000) — hides old outputs
+   only in big steps, and **during pauses**: after `cache_ttl_seconds` (300)
+   without a request the cache has expired anyway, so ctxfit takes that
+   moment to catch up. With arrival on: 51-57% of baseline cost with
+   realistic pauses, 73-74% when the cache never goes cold.
+3. **Running notes** — only to stay under a context limit. They cost more
+   than they save on cached traffic (summariser calls plus re-caching).
+
+`benchmarks/RESULTS.md` has the numbers and the method (synthetic transcripts).
+
+The two layers:
+
+1. **Observation masking** — no model call. Old tool outputs (≥ 400 chars,
+   older than the last 4 turns) become one line:
+   `[ctxfit: tool output hidden - bash - 18234 chars - id 3f9a1c07]`.
+   The id is the first 8 hex of the output's sha256, so you can keep the
+   original and look it up.
+2. **Running notes** — once the masked prompt still passes a high-water mark
+   (default 60,000 est. tokens), the oldest turns are replaced by ONE notes
+   message written by a cheap summariser model *you* supply. Pinned rules stay
+   outside the notes, verbatim.
+
+```python
+import json
+
+import anthropic
+from ctxfit import NotesKeeper, anthropic_summarizer, mask_observations
+
+# Layer 1 only: deterministic, free
+masked, report = mask_observations(messages)          # Anthropic, OpenAI or generic shape
+print(report.summary())
+
+# Both layers: keep one NotesKeeper per conversation
+keeper = NotesKeeper(anthropic_summarizer(anthropic.Anthropic()))  # model="claude-haiku-5-5"
+fitted, report = keeper.fit(body["messages"], system=body.get("system"),
+                            context_management=body.get("context_management"))
+print(report.summary())   # example output:
+# est. tokens: 71,300 → 24,900 (−65.1%) [chars/4]
+#   masked 9 tool output(s), 96,420 chars (boundary turn 20 of 26)
+#   running notes replace 61 earlier message(s) (cut at turn 12, notes ~900 est. tokens)
+#   net saved: 46,400 est. tokens
+#   prompt-cache prefix: stable
+
+state = json.dumps(keeper.state_dict())   # persist between processes; keeper.load_state(...)
+```
+
+Always pass the **full original history** to `keeper.fit()`; it re-applies
+the same cut every time. `openai_summarizer(client, model=...)` works with
+any OpenAI-compatible endpoint, or pass any `(system_prompt, user_prompt) ->
+text` function (return `(text, input_tokens, output_tokens)` to get exact
+spend in the report; raise `SummaryTruncated` if the provider cut the answer
+off). ctxfit imports no SDK; you hand it the client.
+CLI preview of layer 1: `ctxfit mask convo.json --report r.json`
+(`--offload` adds the original outputs; that report file is written owner-only, mode 0600).
+
+**Knobs added in 0.4.0** (all off by default, so 0.3.0 behaviour is unchanged):
+
+- `exclude_tools=["read_file"]` — outputs of these tools are never masked.
+- `clear_at_least_chars=20_000` — the mask boundary only moves when that
+  move hides at least this much. A move rewrites earlier messages and costs a
+  fresh cache write, so small moves are skipped. The applied boundary is
+  remembered in the state and never moves backwards.
+- `mask_style="squeeze"` — instead of a one-line marker, keep a short,
+  deterministic digest: for JSON, its shape and first item or scalar fields;
+  for logs, the first and last lines plus error/fail/warning lines; for
+  other text, the head and tail. Used only when the digest is at most 40% of
+  the original, otherwise the marker. Secrets are scrubbed from it.
+- **Recall.** Hidden outputs stay retrievable by their id. Add
+  `recall_tool("anthropic")` (or `"openai"`) to your request's `tools`; when
+  the model calls `ctxfit_recall`, answer with `keeper.handle_recall(call)`,
+  which returns the ready-made tool result. The text comes back exactly as the tool
+  produced it, **unscrubbed** (secrets included): it is that conversation's own
+  data. Never share a keeper or its offload store across users or
+  conversations.
+
+**Changed in 0.5.0** (state from 0.4.0 is discarded once, `spec_changed`):
+
+- **Markers keep the key facts.** A hidden output's marker now ends with up to
+  8 specifics found in it — file paths, URLs, error codes, versions, ids —
+  e.g. `[ctxfit: tool output hidden - bash - 18234 chars - id 3f9a1c07] - keeps: app/main.py; E1234; v2.3.1`.
+  They are taken from the secret-scrubbed text. On by default
+  (`keep_facts=False` for the old one-liner).
+- **Notes say what can be recalled.** Outputs evicted by a cut stay
+  retrievable by id, and the notes message ends with
+  `[hidden outputs you can recall: 3f9a1c07 bash; ...]` (newest 20). The
+  summariser sees each result's id and is asked to cite it.
+- **Lossless tables.** With `mask_style="squeeze"`, a JSON array of flat
+  objects becomes a pipe table that keeps every value (only secrets are
+  redacted) when that is at most 75% of the original.
+  `squeeze_recent_json=True` does this for the recent turns too.
+- **Prose digest.** Squeezed prose keeps the first and last sentence and the
+  sentences with numbers or facts, instead of a blind head and tail.
+- **`clear_at_least_chars="auto"`** works out per move whether hiding is
+  worth the cache write it causes, from cache prices
+  (`cache_write_multiplier=1.25`, `cache_read_multiplier=0.1`) and how many
+  more requests you expect to reuse the prefix (`expected_reuse=4`).
+
+**New in 0.7.0** (state from 0.6.0 is discarded once, `spec_changed`):
+
+- **Check it on your own history first: `ctxfit replay`.** Reads Claude
+  Code's local transcripts (`~/.claude/projects/**/*.jsonl`, or paths you
+  give, `--since 2026-11-01`; symlinked folders are never followed),
+  rebuilds every request, prices what was
+  really recorded, and shows what each strategy would have cost with prompt
+  caching, how often a hidden output was fetched again, and whether any
+  file read was altered. Nothing leaves your machine; `--redact` prints
+  numbers only; `--json` prints the exact report the TypeScript gateway's
+  `calas-gateway replay` also prints. The system prompt and tools are not in
+  the files, so their size is estimated from the first request's recorded
+  tokens (the report says so), and the simulation is checked against the
+  recorded bill (`calibration_off` if it misses by more than 5%). Running
+  notes are not simulated (they need a summariser).
+- **Anchor tools.** Outputs the model may copy from verbatim — `Read`,
+  `NotebookRead`, `Grep` by default (`anchor_tools=`) — are never hidden,
+  squeezed or reshaped; only an exact repeat of one may become a
+  reference to the earlier copy.
+- **OpenAI Responses API** (`flavor="responses"`, the body's `input`):
+  `function_call_output` items are masked and compacted like tool results;
+  reasoning, compaction and anything encrypted pass through untouched;
+  requests with `previous_response_id` are left alone.
+- **`ctxfit eval`** checks whether a strategy keeps what the model needs:
+  at a few checkpoints per conversation it blanks a fact (a path, code,
+  version, id) out of an output at least 8 turns old and asks a cheap model
+  to fill it in, with the full context and with the strategy's context
+  (`--judge` adds open recall/artifact/next-step/decision questions graded
+  by the model). It prints an estimated price first and will not run
+  without `--max-usd`; `--batch` uses the Message Batches API at half price.
+  **It sends transcript content to the model provider** (tool outputs, file
+  contents, prompts; secrets are scrubbed by pattern, which is not a
+  guarantee) and says so every time. Contexts are sent as plain text turns:
+  tool calls and results become text, thinking blocks are dropped.
+- **Proof kit**: `ctxfit badge --out savings.json` (a shields.io endpoint
+  computed only from the bundled synthetic demo corpus; any other corpus is
+  refused), `scripts/demo.tape`
+  (vhs recording of a replay; the GIF is built in CI, not committed), and a
+  CI job that fails when `benchmarks/RESULTS.md` or `docs/demo-replay.json`
+  no longer match the code.
+
+**Changed in 0.6.0**:
+
+- `arrival="lossless"` (see above; off by default, recommended).
+- **Cold-cache moments.** ctxfit remembers when the last request went out
+  (`clock=` on the keeper, `now=` on `plan_context`). After more than
+  `cache_ttl_seconds` (default 300; `None` turns this off), boundary moves
+  happen regardless of `clear_at_least_chars`, and when running notes need a
+  cut (over high water, as always) it goes as far back as allowed — rewriting
+  is free then. The first request of a conversation counts as cold.
+- Fix: an HTTP status code next to `HTTP`/`status` was counted from the wrong
+  position (now matches the TypeScript port).
+- Lossless tables keep every number exactly as written (big ids, `0.10`,
+  `-0.0`) and are not used when the JSON has duplicate keys.
+- The secret scrubber also catches `sk-` keys after `_`, npm tokens, Slack
+  webhook URLs, secret URL query parameters (`sig`, `token`, `X-Amz-Signature`,
+  ...), 40-hex values after a key name like `GITHUB_TOKEN`, and AWS secrets
+  after a space. URL facts on markers drop their `?query` and `#fragment`.
+- `now=` accepts only `2026-11-05T12:00:00.000Z`-style times (with `Z` or an
+  offset) or epoch seconds; anything else is an error.
+
+**No I/O in the core.** `NotesKeeper` is a thin wrapper. If you want to make
+the summariser call yourself (async, a queue, another process), use the pure
+functions the TypeScript port (calas-gateway) mirrors:
+
+```python
+from ctxfit import NotesConfig, SummaryOutcome, finish_context, plan_context
+
+plan = plan_context(messages, system=system, config=NotesConfig(), state=saved_state)
+outcome = None
+if plan.summary:                       # at most one call per request
+    text = my_cheap_model(plan.summary.system, plan.summary.user)
+    outcome = SummaryOutcome.ok(text, input_tokens, output_tokens)   # or .timeout() / .error("...")
+result = finish_context(plan, outcome)  # result.messages, result.state, result.report
+saved_state = result.state.to_dict()
+```
+
+**What it saves, and the evidence.** Masking old observations first cut agent
+cost by more than half with equal or better task success in JetBrains
+Research's study of coding agents (Dec 2025); summarising on top of masking
+only added a further 7–11%, and the summariser's own spend was over 7% of the
+bill. So masking does the heavy lifting, notes are the last resort, and they
+are updated incrementally: one summariser call per cut move, none while the
+history prefix is unchanged.
+
+**What it protects.** System/developer messages, `pinned: True` messages,
+the first user message (the task) and any user/system/developer message whose
+own text contains `[pin]` are never masked and never summarised: summaries
+were shown to drop rules (0% → 30% violations, arXiv 2606.22528) and keeping
+rules outside the summary brought that back to 0%. An assistant message or a
+tool output cannot pin itself with `[pin]` (use `pinned: True`). The
+`pinned` key is a ctxfit directive, so it is removed from the Anthropic/OpenAI
+messages ctxfit returns. Tool calls are never modified; a cut never separates
+a call from its result (pairing is checked before any summariser call, even
+with reused or missing tool ids). Inputs are never mutated.
+
+**Prompt injection.** Tool output is untrusted. It reaches the summariser
+labelled `[bash result - untrusted data]` with every line indented, so no
+line of it can pose as a message or a rule, and the summariser is told to
+record facts from it but never instructions or permissions. Its answer is
+cleaned before use: `[pin]` tags and anything that looks like a notes header
+are removed and secrets scrubbed. This lowers the risk; it does not remove it
+(a summariser can still be talked into writing a false "fact").
+
+**Trade-offs, plainly.**
+
+- **Prompt cache.** Any rewrite of an earlier part of the prompt breaks
+  provider prompt caching. The masking boundary moves only every 4 turns and
+  the notes only when the high-water mark is passed, so between moves the
+  prefix is byte-identical (`report.cache_stable` tells you). Each move costs
+  one full cache write.
+- **Rules can still drop** if they are not pinned. Pin them (`[pin]` in the
+  text, or `pinned: True`).
+- **The summariser costs money.** It is real spend and the report always
+  subtracts it: `net_saved_tokens_est = before − after − summariser_in −
+  summariser_out`. The request that moves the cut usually shows a *negative*
+  net (the evicted turns are read once by the summariser); it pays back on
+  the requests after it.
+- **Failures fall back, never fail.** An exception, an empty answer, an
+  answer over 2× `notes_max_tokens`, a truncated answer, or a timeout keeps
+  the previous notes and cut and reports `summariser_failed` with a short
+  `failure_reason`. Retries back off: after a failure no new summary is tried
+  for `min_evict_turns` turns, doubling per failure up to 64 turns
+  (`summariser_backoff`), so a broken summariser is not called on every request.
+- **Secrets.** Each message's full text is scrubbed before it is cut down for
+  the summariser: PEM private keys (also unterminated), `sk-`/`sk-ant-`/
+  `sk-proj-` keys, Stripe, AWS, GitHub, GitLab, Slack, Google and Hugging Face
+  tokens, JWTs, `Bearer` tokens, `user:pass@` in URLs and `password: …` /
+  `api_key=…` style values (the key name is kept). Tool-call arguments are
+  scrubbed value by value before they are encoded, and values under keys
+  like `password`, `api_key` or `db_token` are replaced outright. Previous
+  notes and the summariser's answer are scrubbed too.
+- **Provider-managed context is left alone.** If the request uses
+  `context_management`, or carries thinking/compaction/server-tool blocks,
+  ctxfit returns it unchanged (`provider_context`); pass `force=True` to
+  rewrite anyway.
+
+**Limits.**
+
+- Estimates are chars/4 (not your tokenizer) so the Python and TypeScript
+  implementations trigger at exactly the same point; budget with a margin.
+- A masked output is gone from the prompt. If the model needs it again, it has
+  to re-run the tool, or your loop has to serve it from `keeper.recall(id8)`
+  / the `offload=` callback. The in-memory store is capped
+  (`offload_max_bytes`, default 16 MB, oldest dropped first; `0` keeps
+  nothing in memory and only calls your callback).
+- Notes are lossy and only as good as your summariser model. ctxfit does not
+  check them for accuracy, only for length and emptiness.
+- The scrubber is a regex safety net, not a guarantee; secrets in unusual
+  formats get through.
+- `fit` is synchronous: it blocks for the summariser call. The call has a
+  20 s timeout by default (`summarizer_timeout_s`) and runs on a small shared
+  pool of daemon threads; after a timeout ctxfit stops waiting and ignores the
+  late answer, but cannot cancel a call already in flight (it may still be
+  billed). `await keeper.afit(...)` runs `fit` in a worker thread for asyncio code.
+- A `NotesKeeper` is **not thread-safe**: one keeper per conversation, and
+  don't call it from two threads at once (`plan_context`/`finish_context`
+  themselves are pure and safe anywhere).
+- Editing or forking earlier history discards the notes and rebuilds them
+  (one more summariser call); state is per conversation. State from ctxfit
+  0.2.0 (`version: 1`) is accepted and discarded on the next call
+  (`spec_changed`): the notes are rebuilt once.
+- Conversations over 5,000 messages are passed through untouched
+  (`too_many_messages`).
+- Layer 2 needs the whole history each call; it is not a streaming API.
+- Shapes: Anthropic Messages, OpenAI chat.completions, ctxfit generic dicts
+  and `Message` lists (which come back as `Message` objects with their `meta`
+  kept). Not LangChain objects. The notes layer works on the raw provider JSON
+  with its own turn and pin rules; it does not go through `normalize()`.
+
+**How it compares.** Short and factual; read each project's own docs.
+
+| | ctxfit running notes | [Anthropic context editing](https://platform.claude.com/docs/build-with-claude/context-editing) | [OpenAI compaction](https://developers.openai.com/api/docs/guides/compaction.md) | [Headroom](https://github.com/chopratejas/headroom) | [LLMLingua](https://github.com/microsoft/llmlingua) |
+|---|---|---|---|---|---|
+| Where it runs | Your process | Anthropic's servers (beta header) | OpenAI's servers (Responses API) or `/responses/compact` | Your machine (library, proxy, MCP) | Your machine |
+| Providers | Anthropic + OpenAI-shaped JSON | Claude only | OpenAI only | Several | Any (works on text) |
+| What it does to old tool output | Hides, or squeezes to a digest | Clears oldest results to a placeholder | Folds history into an encrypted compaction item | Compresses by content type (JSON, code, prose) | Drops low-importance tokens |
+| Needs a model to compress | Only for notes (your cheap model) | No (clearing) | Yes, OpenAI's | Text model for prose; JSON/code rules otherwise | Yes (small LM / encoder) |
+| Readable result | Yes, plain text | Yes | No ("opaque") | Yes | Yes, but lossy wording |
+| Get the original back | `ctxfit_recall` / offload | No (your client keeps history) | No | Yes (`headroom_retrieve`) | No |
+| Prompt-cache care | Chunked boundary, `clear_at_least_chars`, `cache_stable` report | `clear_at_least` | n/a (server-managed) | CacheAligner flags volatile content | Not a focus |
+
+ctxfit borrows `exclude_tools` and `clear_at_least` from Anthropic's context
+editing and leaves requests that already use it alone (`provider_context`).
+If you are on Claude only and want zero code, context editing is simpler. If
+you need a summary that a human can read, can audit or that works across
+providers, or a record you can recall from, that is where ctxfit fits.
+One honest caveat from our own benchmark: priced with Claude prompt caching,
+masking saves far less money than tokens while the cache stays warm (92-98%
+of baseline cost), squeeze can cost more than doing nothing, and running notes
+cost more — they are for staying under the context limit. Lossless arrival
+compaction and pause-time catch-up are where the money is.
+Savings claims of other projects are their own; ours, on synthetic
+transcripts only, are in `benchmarks/RESULTS.md` (method stated there).
+
+Exact behaviour, including how every ambiguous case is resolved, is pinned by
+shared conformance fixtures (spec v4) that the TypeScript port (calas-gateway)
+runs too.
+
 ## Safety rules (load-bearing)
 
 1. **Pair-atomicity.** Tool calls and results are linked by ID and kept,
@@ -179,9 +493,9 @@ Pinned messages are never dropped; truncated only with explicit opt-in
   (marked `…`); only applied when it actually saves tokens.
 - **Exact-match dedup only.** Near-duplicates are not merged — deliberate;
   fuzzy matching is unexplainable and risky.
-- **No LLM summarization, ever.** Structural compression only. (Subclass
-  `Strategy` with your own summarizer if you want semantic compression —
-  that's your API bill, not ours.)
+- **No LLM calls in `fit()`, ever.** The core pipeline is structural only.
+  Summarisation exists only in the opt-in running notes, through a
+  summariser you supply and pay for (see "Running notes").
 - **Turn counting is user-message-led.** Tool-heavy loops with few user turns
   should use `aggressive=True`.
 - **`to_anthropic` emits system messages as `{"role": "system"}` dicts** —
@@ -194,7 +508,7 @@ Pinned messages are never dropped; truncated only with explicit opt-in
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest          # 104 tests
+.venv/bin/python -m pytest          # 186 tests
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
 ```

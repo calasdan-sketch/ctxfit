@@ -3,6 +3,14 @@
 The core pipeline never touches framework shapes directly. Every input is
 normalized into a list of :class:`Message` objects, strategies operate on
 those, and adapters convert back at the boundary.
+
+The opt-in running-notes layer (:mod:`ctxfit.notes`) is the exception: it
+runs on the raw provider JSON *before* (instead of) :func:`normalize`, so
+the blocks it does not rewrite pass through byte for byte, and it has its own
+turn and pin rules (shared with the TypeScript port; see that module). Given
+``Message`` objects it processes their :meth:`Message.to_dict` form and hands
+back ``Message`` objects with ``meta`` and every other field kept, only
+``content`` changed.
 """
 
 from __future__ import annotations
