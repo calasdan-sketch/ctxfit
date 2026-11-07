@@ -35,8 +35,8 @@ Companion story with [ContextRouter](https://calasautomations.com):
 | Strategy | What it does |
 |---|---|
 | `Deduplicate` | Exact-duplicate message bodies → pointer to the first occurrence |
-| `CompactJson` | JSON arrays → markdown tables; nested objects → flat key paths (only when it saves tokens) |
-| `TruncateToolOutput` | Oversized tool results → head + tail with an explicit omission marker |
+| `CompactJson` | JSON arrays → markdown tables (first 50 rows plus up to 10 outlier rows); nested objects → flat key paths (only when it saves tokens) |
+| `TruncateToolOutput` | Oversized tool results → head + tail, plus the error lines and odd-one-out lines of the omitted middle (with original line numbers), and an explicit omission marker |
 | `SlidingWindow` | Oldest turns dropped while history overflows (pinned + latest turn never dropped) |
 | `DropOldestUnpinned` | Aggressive-mode last resort: oldest-first dropping until the total fits |
 
@@ -45,15 +45,57 @@ default **system 10% / retrieved 55% / history 25% / scratchpad 10%**.
 Strategies compress toward the budgets; surviving overruns produce warnings
 (`strict=True` raises `BudgetOverflow` instead).
 
-**Token estimation:** heuristic by default (chars/4, CJK-adjusted, zero
-dependencies); automatically upgrades to tiktoken's `cl100k_base` when
-installed. Pluggable — implement `count(text)` for your own tokenizer.
+**Token estimation:** a dependency-free estimator by default (`pieces`: counts
+words, digit runs and punctuation separately, CJK-adjusted); automatically
+upgrades to tiktoken's `cl100k_base` when installed. `estimator="heuristic"`
+is the old chars/4. Pluggable — implement `count(text)` for your own
+tokenizer. Measured against cl100k_base (`benchmarks/estimator_bench.py`):
+
+| content | chars/4 | pieces |
+|---|---:|---:|
+| real Python source | 1.10 | 1.03 |
+| real prose | 0.97 | 1.11 |
+| logs (synthetic) | 0.62 | 0.89 |
+| JSON rows (synthetic) | 0.60 | 0.97 |
+
+(estimate / real tokens; 1.00 is exact. chars/4 under-counts machine output by
+about 40%, so a "within budget" answer could be 1.6x over in real tokens.)
 
 **Framework adapters:** raw message-list dicts are first-class
 (`ctxfit.fit` accepts them directly). OpenAI-shaped (also covers
 OpenAI-compatible endpoints like Ollama/freellmapi), Anthropic block-shaped,
 and duck-typed LangChain-shaped helpers convert at the boundary; the core
 never sees framework shapes.
+
+## Does the one important line survive?
+
+Tool output is where context goes, and the line the agent needs (the failing
+migration, the recalled batch, the deadline) is rarely at the head or tail.
+`benchmarks/needle_bench.py` plants one fact in the middle of 20 seeded
+synthetic tool outputs (logs, JSON rows, source, search text) and checks
+whether it is still there afterwards. Real token counts (tiktoken
+cl100k_base), CPU only, no paid API; competitors run only if installed:
+
+| compressor | needles kept | tokens saved | ms/case |
+|---|---:|---:|---:|
+| ctxfit 0.7 behaviour (head+tail, 50 rows) | 0 / 20 | 92.0% | 4 |
+| **ctxfit unreleased 0.8** (salient lines, outlier rows) | **20 / 20** | 91.4% | 7 |
+| [Headroom](https://github.com/chopratejas/headroom) 0.43.1 `compress()` | 20 / 20 | 63.2% | 54 |
+| [LangChain `trim_messages`](https://python.langchain.com/docs/how_to/trim_messages/) (langchain-core 1.7.6, last, 6k) | 10 / 20 | 76.4% | 30 |
+| [LLMLingua-2](https://github.com/microsoft/LLMLingua) 0.2.2, rate 0.2, CPU | 5 / 20 | 69.9% | 17,843 |
+
+The corpus is ours and its needles are the kinds salient-line selection is
+built for (error lines, odd-one-out rows), so read it as "this failure mode is
+fixed", not "ctxfit wins everywhere". Headroom (installed from PyPI, default settings) kept every needle too:
+98.6% saved on logs and 61.6% on JSON, but 0% on the source and prose cases.
+LangChain `trim_messages` drops whole messages, so a single
+large tool result is either kept whole or gone; LLMLingua-2 is a token-dropping
+model (one model, one rate, one run; other settings will differ). Timings are
+one shared cloud CPU, indicative only. Not tested: answer quality
+after compression (see JetBrains Research on masking, cited below),
+non-English text, real transcripts (`ctxfit replay` does that on yours).
+Want to know what a run lost? `ctxfit.fit(..., audit_facts=True)` or
+`--audit-facts` lists the paths, codes, versions and ids that no longer appear.
 
 ## Install
 
@@ -480,14 +522,18 @@ runs too.
 
 ## Limitations (read before trusting it blindly)
 
-- **Estimates, not tokens.** The heuristic is roughly ±25% on mixed prose/code
-  and worse on CJK/emoji-heavy text. **Budget 80–90% of your model's true
-  window** as a safety margin. tiktoken (optional) narrows the error but no
-  heuristic equals your model's actual tokenizer.
+- **Estimates, not tokens.** `pieces` landed within about -11% / +17% of
+  cl100k_base on every class we tested (table above); chars/4 was 40% low on
+  logs and JSON, and emoji-heavy text is still under-counted. **Budget 80–90%
+  of your model's true window** as a safety margin. tiktoken (optional)
+  narrows the error but no estimate equals your model's actual tokenizer.
 - **Lossy by design.** ctxfit deletes and rewrites content to fit budgets.
   Pin anything that must survive verbatim.
-- **Head+tail truncation assumes the middle matters least.** If the critical
-  line is item #500 of 1,000, it will be lost. Pin or pre-filter such payloads.
+- **Head+tail truncation assumes the middle matters least.** Since the
+  unreleased 0.8 it also keeps error lines and lines unlike their neighbours,
+  and outlier JSON rows, but a critical line that looks like every other line
+  (or sits in output with no repeated structure) is still lost. Pin or
+  pre-filter such payloads, and use `audit_facts=True` to see what went.
 - **JSON compaction is whole-message only** (no substring extraction);
   non-uniform object arrays are left alone; table cells truncate at 120 chars
   (marked `…`); only applied when it actually saves tokens.
@@ -508,7 +554,7 @@ runs too.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest          # 186 tests
+.venv/bin/python -m pytest          # 437 tests
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
 ```

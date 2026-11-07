@@ -73,9 +73,9 @@ def test_estimate_text(capsys):
 def test_estimate_file(tmp_path, capsys):
     p = tmp_path / "t.txt"
     p.write_text("a" * 400, encoding="utf-8")
-    rc = main(["estimate", "--file", str(p)])
+    rc = main(["--estimator", "heuristic", "estimate", "--file", str(p)])
     assert rc == 0
-    assert "100" in capsys.readouterr().out  # 400 chars / 4
+    assert "100" in capsys.readouterr().out  # 400 chars / 4 (legacy estimator)
 
 
 def test_missing_file_errors_cleanly(capsys):

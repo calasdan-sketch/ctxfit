@@ -41,6 +41,7 @@ def _build_pipeline(args: argparse.Namespace) -> FitPipeline:
         budget=Budget.from_overrides(total=args.budget, overrides=_parse_budgets(args.budgets)),
         strict=args.strict,
         aggressive=args.aggressive,
+        audit_facts=getattr(args, "audit_facts", False),
     )
 
 
@@ -215,13 +216,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--estimator",
         default="auto",
-        help="'auto' (tiktoken if installed, else heuristic), 'heuristic', 'tiktoken'",
+        help="'auto' (tiktoken if installed, else pieces), 'pieces', 'heuristic' (chars/4), 'tiktoken'",
     )
     p.add_argument(
         "--flavor", default="auto", help="'auto', 'openai', 'anthropic', 'langchain', 'generic'"
     )
     p.add_argument(
         "--aggressive", action="store_true", help="enable last-resort drop-oldest-unpinned strategy"
+    )
+    p.add_argument(
+        "--audit-facts",
+        action="store_true",
+        help="report which paths/URLs/codes/versions/ids from tool output did not survive",
     )
     p.add_argument(
         "--strict",
@@ -298,7 +304,44 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_GLOBAL_VALUE_FLAGS = ("--budget", "--budgets", "--estimator", "--flavor")
+_GLOBAL_BOOL_FLAGS = ("--aggressive", "--audit-facts", "--strict")
+_SUBCOMMANDS = ("analyze", "fit", "mask", "replay", "eval", "badge", "estimate")
+
+
+def _hoist_global_options(argv: list[str]) -> list[str]:
+    """Accept the global options after the subcommand too.
+
+    The README shows ``ctxfit analyze convo.json --budget 128000``; argparse
+    only takes them before the subcommand, so move them there.
+    """
+    try:
+        at = next(i for i, a in enumerate(argv) if a in _SUBCOMMANDS)
+    except StopIteration:
+        return argv
+    head, rest, hoisted = argv[:at], argv[at + 1 :], []
+    keep: list[str] = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--":
+            keep.extend(rest[i:])
+            break
+        if a in _GLOBAL_BOOL_FLAGS:
+            hoisted.append(a)
+        elif a in _GLOBAL_VALUE_FLAGS and i + 1 < len(rest):
+            hoisted.extend([a, rest[i + 1]])
+            i += 1
+        elif a.split("=", 1)[0] in _GLOBAL_VALUE_FLAGS and "=" in a:
+            hoisted.append(a)
+        else:
+            keep.append(a)
+        i += 1
+    return head + hoisted + [argv[at]] + keep
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = _hoist_global_options(list(sys.argv[1:] if argv is None else argv))
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 from .adapters import to_anthropic, to_lc_messages, to_openai
 from .budgets import Budget, BudgetLedger, BudgetOverflow, OverflowWarning
 from .estimate import TokenEstimator, count_by_section, get_estimator, top_consumers
-from .messages import Message, normalize, validate_pairing
+from .messages import KIND_TOOL_RESULT, Message, normalize, validate_pairing
 from .strategies import (
     AGGRESSIVE_STRATEGIES,
     DEFAULT_STRATEGIES,
@@ -30,6 +31,12 @@ class FitReport:
     estimator_name: str = "heuristic"
     total_budget: int = 128_000
     aggressive: bool = False
+    # Fact audit (opt-in, ``audit_facts=True``): specifics (paths, URLs, error
+    # codes, versions, ids) seen in tool output before, and which of them no
+    # longer appear anywhere in the fitted messages. None = audit not run.
+    facts_seen: int | None = None
+    facts_lost: list[str] = field(default_factory=list)
+    facts_lost_count: int = 0
 
     @property
     def total_before(self) -> int:
@@ -79,6 +86,17 @@ class FitReport:
                 )
         else:
             lines.append("within budget ✓")
+        if self.facts_seen is not None:
+            if self.facts_lost_count:
+                sample = "; ".join(_safe(t) for t in self.facts_lost[:5])
+                lines.append(
+                    f"facts: {self.facts_lost_count} of {self.facts_seen} specifics from tool "
+                    f"output are gone (e.g. {sample})"
+                )
+            else:
+                lines.append(
+                    f"facts: all {self.facts_seen} specifics from tool output still present"
+                )
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +110,9 @@ class FitReport:
             "saved_est": self.saved_est,
             "savings_pct": round(self.savings_pct, 2),
             "over_budget": self.over_budget,
+            "facts_seen": self.facts_seen,
+            "facts_lost_count": self.facts_lost_count,
+            "facts_lost": self.facts_lost,
             "warnings": [str(w) for w in self.warnings],
             "strategies": [
                 {
@@ -103,6 +124,37 @@ class FitReport:
                 for sr in self.strategy_reports
             ],
         }
+
+
+_AUDIT_MAX_CHARS = 4_000_000
+_UNSAFE_RE = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+
+
+def _safe(token: str) -> str:
+    """Make untrusted text printable: control, bidi and zero-width chars -> \\uXXXX."""
+    return _UNSAFE_RE.sub(lambda m: f"\\u{ord(m.group()):04x}", token)[:120]
+
+
+def _audit_facts(
+    before: Sequence[Message], after: Sequence[Message]
+) -> tuple[int | None, list[str]]:
+    """(facts seen in tool output before, those absent from every message after)."""
+    from .notes import _clean_fact, _raw_fact_tokens
+
+    sources = [m.content for m in before if m.kind == KIND_TOOL_RESULT or m.section == "retrieved"]
+    if sum(len(t) for t in sources) > _AUDIT_MAX_CHARS:
+        return None, []  # too large to audit cheaply; report says "not run"
+    seen: dict[str, None] = {}
+    for text in sources:
+        for raw in _raw_fact_tokens(text):
+            tok = _clean_fact(raw)
+            if tok:
+                seen.setdefault(tok)
+    haystack = "\n".join(m.content for m in after)
+    lost = [t for t in seen if t not in haystack]
+    return len(seen), lost
 
 
 class PairingBroken(Exception):
@@ -119,7 +171,9 @@ class FitPipeline:
         budget: Budget | None = None,
         strict: bool = False,
         aggressive: bool = False,
+        audit_facts: bool = False,
     ) -> None:
+        self.audit_facts = audit_facts
         if strategies is None:
             kinds = AGGRESSIVE_STRATEGIES if aggressive else DEFAULT_STRATEGIES
             strategies = [k() for k in kinds]
@@ -170,7 +224,14 @@ class FitPipeline:
             raise BudgetOverflow(
                 "over budget after pipeline: " + "; ".join(str(w) for w in warnings)
             )
+        facts_seen: int | None = None
+        lost: list[str] = []
+        if self.audit_facts:
+            facts_seen, lost = _audit_facts(messages, current)
         report = FitReport(
+            facts_seen=facts_seen,
+            facts_lost=lost[:20],
+            facts_lost_count=len(lost),
             tokens_before=before,
             tokens_after=after,
             strategy_reports=strategy_reports,
@@ -231,6 +292,7 @@ def fit(
     strict: bool = False,
     aggressive: bool = False,
     flavor: str = "auto",
+    audit_facts: bool = False,
 ) -> tuple[list[Any], FitReport]:
     """One-call API: fit raw messages within budget.
 
@@ -256,5 +318,6 @@ def fit(
         budget=Budget.from_overrides(total=total_budget, overrides=budgets),
         strict=strict,
         aggressive=aggressive,
+        audit_facts=audit_facts,
     )
     return pipeline.fit(raw, flavor=flavor)

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .budgets import Budget, BudgetLedger
-from .estimate import TokenEstimator, count_by_section
+from .estimate import TokenEstimator
 from .messages import (
     KIND_TEXT,
     KIND_TOOL_CALL,
@@ -31,6 +31,11 @@ from .messages import (
     turn_indexes,
 )
 
+_SEVERITY_RE = re.compile(
+    r"\b(fatal|error|errors|exception|traceback|panic|critical|fail|failed|failure|denied|"
+    r"refused|timed out|timeout|segfault|aborted|cannot|unable|invalid|unhandled)\b",
+    re.IGNORECASE,
+)
 MARKER_PREFIX = "[ctxfit"
 
 
@@ -109,7 +114,17 @@ def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _pair_closure(messages: list[Message], drop: set) -> set:
+def _call_index(messages: list[Message]) -> dict[str, list[int]]:
+    by_call: dict[str, list[int]] = {}
+    for j, m in enumerate(messages):
+        if m.call_id and m.kind in (KIND_TOOL_CALL, KIND_TOOL_RESULT):
+            by_call.setdefault(m.call_id, []).append(j)
+    return by_call
+
+
+def _pair_closure(
+    messages: list[Message], drop: set, by_call: dict[str, list[int]] | None = None
+) -> set:
     """Expand a drop-set so tool_call/tool_result pairs drop atomically.
 
     Follows call_id links to a fixpoint: if any message in the drop set is
@@ -117,10 +132,8 @@ def _pair_closure(messages: list[Message], drop: set) -> set:
     turn it lives in. Callers must check the expanded set for pinned
     messages *before* dropping — a pinned partner vetoes the whole drop.
     """
-    by_call: dict[str, list[int]] = {}
-    for j, m in enumerate(messages):
-        if m.call_id and m.kind in (KIND_TOOL_CALL, KIND_TOOL_RESULT):
-            by_call.setdefault(m.call_id, []).append(j)
+    if by_call is None:
+        by_call = _call_index(messages)
     expanded = set(drop)
     changed = True
     while changed:
@@ -184,7 +197,39 @@ class Deduplicate(Strategy):
         return out, report
 
 
-def _json_table(data: list[dict[str, Any]], max_rows: int) -> str | None:
+def _outlier_rows(data: list[dict[str, Any]], keys: list[str], skip: int, limit: int) -> list[int]:
+    """Indexes (>= ``skip``) of rows that differ from an otherwise uniform column.
+
+    A column counts when one value fills at least 60% of the rows and the
+    column has few distinct values (<= max(12, n/10)); a row whose value
+    there occurs at most twice is an outlier. Rows with a severity word
+    (error, failed, ...) in any string cell also count. Deterministic.
+    """
+    n = len(data)
+    if limit <= 0 or n <= skip:
+        return []
+    flags: dict[int, int] = {}
+    for k in keys:
+        col = [json.dumps(r[k], sort_keys=True, ensure_ascii=False) for r in data]
+        freq: dict[str, int] = {}
+        for v in col:
+            freq[v] = freq.get(v, 0) + 1
+        if len(freq) > max(12, n // 10) or max(freq.values()) < 0.6 * n:
+            continue
+        for i in range(skip, n):
+            if freq[col[i]] <= 2:
+                flags[i] = flags.get(i, 0) + 2
+    for i in range(skip, n):
+        for k in keys:
+            v = data[i][k]
+            if isinstance(v, str) and _SEVERITY_RE.search(v):
+                flags[i] = flags.get(i, 0) + 1
+                break
+    ranked = sorted(flags, key=lambda i: (-flags[i], i))[:limit]
+    return sorted(ranked)
+
+
+def _json_table(data: list[dict[str, Any]], max_rows: int, max_outliers: int = 10) -> str | None:
     if not data or not all(isinstance(r, dict) for r in data):
         return None
     keys: list[str] = list(data[0].keys())
@@ -205,6 +250,13 @@ def _json_table(data: list[dict[str, Any]], max_rows: int) -> str | None:
     omitted = len(data) - len(rows)
     if omitted:
         lines.append(f"| … {omitted} more rows omitted |")
+        picked = _outlier_rows(data, keys, len(rows), max_outliers)
+        if picked:
+            lines.append(
+                f"[ctxfit: {len(picked)} outlier row(s) from the omitted rows; (row n) is the 0-based index]"
+            )
+            for i in picked:
+                lines.append("| " + " | ".join(cell(data[i][k]) for k in keys) + f" | (row {i})")
     return "\n".join(lines)
 
 
@@ -245,9 +297,15 @@ class CompactJson(Strategy):
     target_sections = ("retrieved", "history")
 
     def __init__(
-        self, max_rows: int = 50, max_keys: int = 120, max_depth: int = 6, **kw: Any
+        self,
+        max_rows: int = 50,
+        max_keys: int = 120,
+        max_depth: int = 6,
+        max_outliers: int = 10,
+        **kw: Any,
     ) -> None:
         super().__init__(**kw)
+        self.max_outliers = max_outliers
         self.max_rows = max_rows
         self.max_keys = max_keys
         self.max_depth = max_depth
@@ -265,7 +323,7 @@ class CompactJson(Strategy):
                 out.append(m)
                 continue
             if isinstance(data, list):
-                compacted = _json_table(data, self.max_rows)
+                compacted = _json_table(data, self.max_rows, self.max_outliers)
             elif isinstance(data, dict):
                 compacted = _json_flat(data, self.max_keys, self.max_depth)
             if not compacted:
@@ -298,6 +356,69 @@ class CompactJson(Strategy):
         return out, report
 
 
+_TEMPLATE_NUM_RE = re.compile(r"0x[0-9a-fA-F]+|[0-9a-fA-F]{8,}|\d+")
+_LINE_CAP = 300
+
+
+def _line_template(line: str) -> str:
+    """The line with numbers/hex ids blanked, so 'same kind of line' compares equal."""
+    return re.sub(r"\s+", " ", _TEMPLATE_NUM_RE.sub("#", line.strip()))
+
+
+def salient_lines(middle: str, budget_chars: int, max_lines: int = 20) -> list[tuple[int, str]]:
+    """Pick the lines of ``middle`` a reader would regret losing.
+
+    Deterministic, no model. Two signals: severity words (error, fatal,
+    traceback, ...), and rarity: when most lines are repeats of a few
+    templates (logs, tables, generated code), the lines whose template
+    occurs once or twice are the odd ones out. Repeated severity lines are
+    collapsed to the first one plus a count. The first and last "line" of
+    ``middle`` are skipped (they are cut mid-line). Returns
+    ``[(index_in_middle, text)]`` in original order within ``budget_chars``.
+    """
+    lines = middle.split("\n")
+    if len(lines) < 3:
+        return []
+    templates = [_line_template(ln) for ln in lines]
+    counts: dict[str, int] = {}
+    for t in templates:
+        if t:
+            counts[t] = counts.get(t, 0) + 1
+    nonblank = sum(counts.values())
+    boiler = sum(c for c in counts.values() if c >= 3)
+    rarity_informative = nonblank > 0 and boiler / nonblank >= 0.3
+    first_seen: dict[str, int] = {}
+    scored: list[tuple[int, int, str]] = []  # (-score, index, text)
+    for i in range(1, len(lines) - 1):
+        t = templates[i]
+        if not t:
+            continue
+        severe = bool(_SEVERITY_RE.search(lines[i]))
+        rare = rarity_informative and counts[t] <= 2
+        if not (severe or rare):
+            continue
+        if severe and counts[t] >= 3:
+            if t in first_seen:
+                continue  # repeated severity line: only the first is kept
+            first_seen[t] = i
+        text = lines[i].strip()
+        if len(text) > _LINE_CAP:
+            text = text[:_LINE_CAP] + "…"
+        if severe and counts[t] >= 3:
+            text += f"  [x{counts[t]} similar]"
+        scored.append((-(2 * severe + rare), i, text))
+    scored.sort()
+    chosen: list[tuple[int, str]] = []
+    used = 0
+    for _neg, i, text in scored:
+        if len(chosen) >= max_lines or used + len(text) + 8 > budget_chars:
+            continue
+        chosen.append((i, text))
+        used += len(text) + 8
+    chosen.sort()
+    return chosen
+
+
 class TruncateToolOutput(Strategy):
     """Head+tail truncation for oversized tool results.
 
@@ -305,6 +426,11 @@ class TruncateToolOutput(Strategy):
     both are kept, the middle is replaced with one explicit marker line.
     Pair-preserving (truncation never orphans a pair). Pinned messages are
     skipped unless ``truncate_pinned=True``.
+
+    With ``salient=True`` (default, unreleased 0.8.0 candidate) the omitted middle is not
+    thrown away blindly: up to ``salient_chars`` of its error lines and
+    odd-one-out lines are kept, with their original line numbers (see
+    :func:`salient_lines`). ``salient=False`` gives the old head+tail only.
     """
 
     name = "truncate_tool_output"
@@ -317,11 +443,17 @@ class TruncateToolOutput(Strategy):
         tail_chars: int = 1200,
         truncate_pinned: bool = False,
         include_retrieved_text: bool = False,
+        salient: bool = True,
+        salient_chars: int = 1200,
         **kw: Any,
     ) -> None:
         super().__init__(**kw)
         if head_chars + tail_chars >= max_chars:
             raise ValueError("head_chars + tail_chars must be < max_chars")
+        if salient_chars < 0:
+            raise ValueError("salient_chars must be >= 0")
+        self.salient = salient
+        self.salient_chars = salient_chars
         self.max_chars = max_chars
         self.head_chars = head_chars
         self.tail_chars = tail_chars
@@ -354,6 +486,19 @@ class TruncateToolOutput(Strategy):
                 f"omitted {omitted:,} chars (~{omitted_tokens:,} est. tokens)"
             )
             new_content = head + "\n" + marker + "\n" + tail
+            if self.salient and self.salient_chars:
+                middle = m.content[self.head_chars : len(m.content) - self.tail_chars]
+                picked = salient_lines(middle, self.salient_chars)
+                if picked:
+                    base = m.content[: self.head_chars].count("\n") + 1
+                    body = "\n".join(f"L{base + i}: {text}" for i, text in picked)
+                    note = _marker(
+                        f"kept {len(picked)} salient line(s) from the omitted middle "
+                        "(errors / odd-one-out lines); L<n> = original line number"
+                    )
+                    candidate = head + "\n" + marker + "\n" + note + "\n" + body + "\n" + tail
+                    if len(candidate) < len(m.content):
+                        new_content = candidate
             saved = ctx.estimator.count(m.content) - ctx.estimator.count(new_content)
             out.append(
                 Message(
@@ -407,12 +552,11 @@ class SlidingWindow(Strategy):
 
         allowance = ctx.budget.allowance("history")
 
-        def history_over(excluded: set[int]) -> bool:
-            usage = count_by_section(
-                [m for j, m in enumerate(messages) if j not in excluded],
-                ctx.estimator,
-            )
-            return usage.get("history", 0) > allowance
+        # Count each message once; keep a running history total instead of
+        # re-counting the whole conversation per candidate turn (was O(n^2)).
+        call_index = _call_index(messages)
+        counts = [ctx.estimator.count_message(m) for m in messages]
+        history_total = sum(c for m, c in zip(messages, counts) if m.section == "history")
 
         drop: set[int] = set()
         dropped_turns = 0
@@ -428,20 +572,23 @@ class SlidingWindow(Strategy):
             # Pair closure: a turn's tool_call may pair with a tool_result
             # living in another section (retrieved). They drop together or
             # not at all — a pinned partner vetoes the whole turn.
-            candidate = _pair_closure(messages, set(idxs))
+            candidate = _pair_closure(messages, set(idxs), call_index)
             if any(messages[j].pinned for j in candidate):
                 report.actions.append(f"sliding_window: kept turn {t} (pair partner pinned)")
                 continue
-            need = history_over(drop) or (
+            need = (history_total > allowance) or (
                 self.when == "always" and len(ordered) - dropped_turns > self.keep_turns
             )
             if not need:
                 break
+            for j in candidate - drop:
+                if messages[j].section == "history":
+                    history_total -= counts[j]
             drop.update(candidate)
             dropped_turns += 1
 
         if drop:
-            saved = sum(ctx.estimator.count_message(messages[j]) for j in drop)
+            saved = sum(counts[j] for j in drop)
             kept = [m for j, m in enumerate(messages) if j not in drop]
             report.saved_tokens_est = saved
             report.messages_affected = len(drop)
@@ -477,9 +624,11 @@ class DropOldestUnpinned(Strategy):
             if m.call_id and m.kind in (KIND_TOOL_CALL, KIND_TOOL_RESULT):
                 by_call.setdefault(m.call_id, []).append(j)
 
+        # Running total: a message's count never depends on its position.
+        running = sum(ctx.estimator.count_message(m) for m in messages)
+
         def total_over() -> bool:
-            usage = count_by_section(messages, ctx.estimator)
-            return sum(usage.values()) > ctx.budget.total
+            return running > ctx.budget.total
 
         idx = 0
         while idx < len(messages) and total_over():
@@ -502,6 +651,7 @@ class DropOldestUnpinned(Strategy):
                     ctx.estimator.count_message(m),
                 )
             doomed_set = set(doomed)
+            running -= sum(ctx.estimator.count_message(messages[k]) for k in doomed_set)
             messages = [mm for k, mm in enumerate(messages) if k not in doomed_set]
             # rebuild bookkeeping after mutation
             turns = turn_indexes(messages)

@@ -4,6 +4,7 @@ import pytest
 
 from ctxfit.estimate import (
     HeuristicEstimator,
+    PieceEstimator,
     TiktokenEstimator,
     count_by_section,
     get_estimator,
@@ -42,10 +43,11 @@ def test_count_message_adds_overhead(est):
     assert est.count_message(m) == est.count("hi") + 4
 
 
-def test_get_estimator_auto_falls_back_to_heuristic():
+def test_get_estimator_auto_falls_back_to_pieces():
     # tiktoken is not installed in this env
     e = get_estimator("auto")
-    assert isinstance(e, HeuristicEstimator)
+    assert isinstance(e, PieceEstimator)
+    assert isinstance(get_estimator("heuristic"), HeuristicEstimator)  # legacy name kept
 
 
 def test_get_estimator_heuristic():
