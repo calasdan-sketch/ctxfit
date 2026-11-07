@@ -10,7 +10,7 @@ plus incremental notes written by a summariser model you supply.
 
 from .budgets import Budget, BudgetLedger, BudgetOverflow, OverflowWarning
 from .estimate import HeuristicEstimator, TiktokenEstimator, TokenEstimator, get_estimator
-from .messages import Message, normalize, validate_pairing
+from .messages import Message, normalize, repair_pairing, validate_pairing
 from .notes import (
     MaskReport,
     NotesConfig,
@@ -41,7 +41,7 @@ from .strategies import (
     output_id,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "Budget",
@@ -83,5 +83,6 @@ __all__ = [
     "plan_context",
     "recall_tool",
     "scrub_secrets",
+    "repair_pairing",
     "validate_pairing",
 ]

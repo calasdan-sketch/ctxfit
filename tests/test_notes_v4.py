@@ -60,7 +60,12 @@ def test_facts_on_hide_marker_and_off_switch():
 
 
 def test_facts_never_see_secrets():
-    text = "key sk-ant-api03-AAAABBBBCCCCDDDDEEEE at https://u:pw123@x.io/a and ghp_" + "a" * 30
+    text = (
+        "key sk-"
+        + "ant-api03-AAAABBBBCCCCDDDDEEEE at https://u:pw123@x.io/a and gh"
+        + "p_"
+        + "a" * 30
+    )
     facts = extract_facts(scrub_secrets(text))
     assert all("AAAA" not in f and "pw123" not in f and "redacted" not in f for f in facts)
 

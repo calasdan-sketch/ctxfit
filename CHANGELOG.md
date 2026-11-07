@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.8.0 candidate; `__version__` is still 0.7.0 on purpose, see note)
+## 0.8.0 (not released yet: PyPI still has 0.1.1, the repo was 0.7.0)
 
 Found by putting ctxfit through five expert reviews (LLM app engineer, token-cost
 analyst, agent-memory researcher, performance engineer, sceptical agent developer).
@@ -32,6 +32,61 @@ analyst, agent-memory researcher, performance engineer, sceptical agent develope
   in the fitted messages (`report.facts_lost`, shown in `summary()`; control and bidi
   characters are escaped). Off by default; skipped above 4M characters of tool output.
 - `benchmarks/needle_bench.py`, `needle_corpus.py`, `estimator_bench.py`.
+
+### Round 4: what a stranger gets from `pip install ctxfit`
+
+Panel: a first-hour user following only the README, a release/packaging engineer, a supply-chain
+reviewer, a docs writer, a CI/CD integrator, a hostile-input fuzzer, a performance engineer and a
+competitor's maintainer (details and the commands behind each finding: `docs/ROUND4.md`).
+
+#### Fixed
+- **`ctxfit --version` did not exist** and `python -m ctxfit` failed. Both work.
+- **Crash on a console that cannot show `→ − ✓`** (Windows cp1252/cp437, `LC_ALL=C`):
+  `ctxfit fit` died with a `UnicodeEncodeError` after doing the work. Output now falls back to
+  `->`, `-`, `ok`; `--out -` writes plain-ASCII JSON on such a console.
+- **Tracebacks for ordinary mistakes.** A conversation with an orphaned tool result (common in
+  sliced transcripts), a `null` or string inside an Anthropic `content` list, or any unexpected
+  error printed a Python traceback. They are now one plain sentence and exit code 1.
+  Missing file, folder, empty file, invalid JSON, non-UTF-8 file, wrong JSON shape, read-only
+  folder and missing output folder each get their own sentence naming the file.
+- **With `tiktoken` installed (the recommended extra), any text containing `<|endoftext|>` (or
+  another special-token spelling) made `fit()` raise `ValueError`.** A web page, a tokenizer
+  discussion or a prompt-injection attempt in a tool output was enough. Such text is now
+  counted as ordinary text.
+- **With `tiktoken` installed but no network** (it downloads its vocabulary on first use),
+  `ctxfit` and `fit(estimator="auto")` failed with a connection error. `auto` now falls back
+  to the built-in estimator (the report names the one used); `estimator="tiktoken"` says what to do.
+- `ctxfit analyze file | head` printed `Broken pipe` as an error. It exits quietly now.
+- **`ctxfit replay '*.jsonl'`** (a bare pattern in the current folder) found 0 files.
+- Replacing the `--out` file is retried on `PermissionError` (Windows holds files an editor or
+  virus scanner has open), then reported as a sentence.
+- The summary note for images and thinking blocks said "pinned"; they are handed back unchanged
+  and are *not* pinned (README was right, the report text was wrong).
+- Estimator: any text containing a non-ASCII character (such as the `…` in every cut marker) was
+  counted by a per-character Python loop; now one regex pass. Same numbers (checked on 20,000
+  random strings), about 2x faster on that path.
+- Tests no longer contain contiguous key-shaped strings (AWS, GitHub, Anthropic, Slack, PEM, JWT
+  shapes are assembled at runtime), so GitHub push protection and PyPI scanners have nothing to flag.
+
+#### Added
+- `ctxfit demo`: fits a built-in made-up agent run and checks three planted facts survived
+  (exit 1 if one is lost). Needs no files, network or key; doubles as an install smoke test.
+- `fit(..., pairing="repair")` / `FitPipeline(pairing=)` / `ctxfit fit --repair-pairing`:
+  drops unmatched tool calls/results (and repeated ids) instead of raising; the report counts
+  and lists them; a message that also holds images is never dropped (error instead).
+  Default stays `"strict"`. `ctxfit.repair_pairing()` is exported.
+- `--json` for `analyze`, `fit`, `estimate`, `demo`; `ctxfit estimate -` reads standard input.
+  Exit codes are documented.
+- Packaging: `LICENSE` file (the MIT licence was declared but not shipped), `py.typed`,
+  SPDX `license = "MIT"` (needs setuptools 77+ to build), Python 3.10-3.13 / OS / Typing
+  classifiers, Repository / Issues / Changelog URLs, `MANIFEST.in` (sdist now carries
+  CHANGELOG, benchmarks and docs), single-sourced version.
+- CI: tests on Python 3.10 and 3.13 and on `windows-latest`, plus a job that builds the sdist and
+  wheel, runs `twine check`, installs the wheel into a clean environment and runs `ctxfit demo`.
+- `tests/test_round4.py` (61 tests).
+
+#### Not changed on purpose
+`fit()` defaults, strategies and output are as in round 3 (benchmark rows identical).
 
 ### Round 3 (second expert pass, same unreleased line)
 
@@ -83,6 +138,9 @@ answer-quality evaluation of `fit()` output (needs a paid model call; `ctxfit ev
 Still untested: a real Windows machine, non-English transcripts, real provider calls.
 
 ### Notes
-- Version: the shared conformance fixtures (`../fixtures`, also run by the TypeScript port)
-  embed the library version, so the bump waits for a coordinated fixture regeneration.
-- No change to running notes (`ctxfit.notes`), its state, or its spec.
+- Version: bumped to 0.8.0 in round 4 (single source: `ctxfit.__version__`; `pyproject.toml`
+  reads it). The shared conformance fixtures embed the library version in their `generator`
+  field; they were regenerated with `fixtures/generate.py` and only that string changed (61 files).
+  The TypeScript port only checks that the field looks like `ctxfit <digits>`.
+- No change to running notes (`ctxfit.notes`), its state, or its spec. Re-running
+  `benchmarks/running_notes_bench.py` changed only the version in the header of `RESULTS.md`.

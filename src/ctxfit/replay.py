@@ -215,8 +215,15 @@ def expand_paths(paths: Sequence[str]) -> list[str]:
             base = "/".join(fixed) or "."
             if not os.path.isdir(base):
                 continue
-            rx = _glob_regex(p.replace(os.sep, "/"))
-            out.update(f for f in _walk_files(base) if rx.fullmatch(f.replace(os.sep, "/")))
+            pat = p.replace(os.sep, "/")
+            rx = _glob_regex(pat)
+            bare = base == "." and not pat.startswith("./")  # `*.jsonl` meets `./x.jsonl`
+            for f in _walk_files(base):
+                name = f.replace(os.sep, "/")
+                if bare and name.startswith("./"):
+                    name = name[2:]
+                if rx.fullmatch(name):
+                    out.add(f[2:] if bare and f.startswith("." + os.sep) else f)
         elif os.path.isdir(p):
             out.update(f for f in _walk_files(p) if f.endswith(".jsonl"))
         elif os.path.isfile(p):

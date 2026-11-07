@@ -30,3 +30,38 @@ jobs:
           path: |
             docs/demo.gif
             savings.json
+
+  # The oldest and newest supported Python, and Windows (never run by hand: this is its only check).
+  matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.12" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+      - run: ctxfit demo
+
+  # What `pip install ctxfit` really gives: build, check, install the wheel somewhere clean.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - run: python -m venv /tmp/clean && /tmp/clean/bin/pip install dist/*.whl
+      - run: /tmp/clean/bin/ctxfit --version
+      - run: /tmp/clean/bin/ctxfit demo
+      - run: /tmp/clean/bin/python -c "import importlib.metadata as m; assert m.version('ctxfit') == __import__('ctxfit').__version__; assert not m.requires('ctxfit') or all('extra' in r for r in m.requires('ctxfit'))"

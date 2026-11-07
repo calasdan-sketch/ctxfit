@@ -9,22 +9,39 @@ result sits uncompressed in context for the rest of the run.
 ships: structural context compression with budget enforcement. No LLM calls,
 no framework lock-in, deterministic. Opt-in running notes for long agent runs.
 
+```bash
+pip install ctxfit
+ctxfit demo          # no files, no network, no API key: fits a made-up agent run
+```
+
+```
+ctxfit demo: a made-up coding-agent run with 3 big tool outputs (nothing is sent anywhere)
+est. tokens: 36,927 → 2,429 (−93.4%) [pieces]
+  system            11 →        11
+  retrieved     36,884 →     2,386
+  history           32 →        32
+  compact_json: −7,683 est. tokens, 1 message(s)
+  truncate_tool_output: −26,815 est. tokens, 2 message(s)
+within budget ✓
+
+  kept: the failing migration line in a 1,500-line log
+  kept: the one failed row in 300 JSON rows
+  kept: the unfinished function in 400 lines of source
+```
+
 ```python
 import ctxfit
 
-fitted, report = ctxfit.fit(messages, total_budget=128_000)
-print(report.summary())
-# est. tokens: 96,400 → 41,150 (−57.3%) [heuristic]
-#   retrieved   71,200 →   18,400
-#   history     24,100 →   21,650
-#   truncate_tool_output: −52,800 est. tokens, 3 message(s)
-#   within budget ✓
+fitted, report = ctxfit.fit(messages, total_budget=128_000)   # messages: your list of dicts
+print(report.summary())                                       # same kind of report as above
 ```
 
 Companion story with [ContextRouter](https://calasautomations.com):
 *"ContextRouter picks what goes in, ctxfit keeps it lean."*
 
-- PyPI: `ctxfit` · npm: `@decnutz/ctxfit`
+- Python 3.10+, no dependencies. Source: <https://github.com/calasdan-sketch/ctxfit>
+- PyPI: `ctxfit`. A TypeScript port of the running-notes layer lives in the `calas-gateway` repo;
+  it is **not** on npm under either name (checked 2026-11-07), so there is nothing to `npm i` yet.
 
 ---
 
@@ -53,8 +70,8 @@ tokenizer. Measured against cl100k_base (`benchmarks/estimator_bench.py`):
 
 | content | chars/4 | pieces |
 |---|---:|---:|
-| real Python source (varies with the files on the machine) | 1.10 | 1.03 |
-| real prose | 0.97 | 1.11 |
+| real Python source (varies with the files on the machine) | 1.01 | 1.03 |
+| real prose | 0.96 | 1.13 |
 | logs (synthetic) | 0.62 | 0.89 |
 | JSON rows (synthetic) | 0.60 | 0.97 |
 
@@ -79,7 +96,7 @@ cl100k_base), CPU only, no paid API; competitors run only if installed:
 | compressor | needles kept | tokens saved | ms/case |
 |---|---:|---:|---:|
 | ctxfit 0.7 behaviour (head+tail, 50 rows) | 0 / 20 | 92.0% | 4 |
-| **ctxfit unreleased 0.8** (salient lines, outlier rows) | **20 / 20** | 91.4% | 6 |
+| **ctxfit 0.8** (salient lines, outlier rows) | **20 / 20** | 91.4% | 6 |
 | [Headroom](https://github.com/chopratejas/headroom) 0.43.1 `compress()` | 20 / 20 | 63.2% | 54 |
 | [LangChain `trim_messages`](https://python.langchain.com/docs/how_to/trim_messages/) (langchain-core 1.7.6, last, 6k) | 10 / 20 | 76.4% | 30 |
 | [LLMLingua-2](https://github.com/microsoft/LLMLingua) 0.2.2, rate 0.2, CPU | 5 / 20 | 69.9% | 17,843 |
@@ -97,21 +114,30 @@ non-English text, real transcripts (`ctxfit replay` does that on yours).
 Want to know what a run lost? `ctxfit.fit(..., audit_facts=True)` or
 `--audit-facts` lists the paths, codes, versions and ids that no longer appear.
 Competitor versions were re-checked on PyPI on 2026-11-07 (still the ones above); their
-rows were not re-run. Headroom's README also lists reversible retrieval (`headroom_retrieve`)
+rows were not re-run. The table's token counts used tiktoken; a rerun in round 4 without
+tiktoken (ctxfit's own estimator) still kept 20 / 20 needles at 91.9% saved. Headroom's README also lists reversible retrieval (`headroom_retrieve`)
 and ML image compression, which `fit()` only partly matches (see `offload=` below; images are
 left untouched, not shrunk).
 
 Speed on one huge output (`benchmarks/needle_bench.py --big`, default estimator, one shared
-cloud CPU, indicative): a 4.8 MB log of 400k repeated lines 6.1 s -> 1.0 s, 3 MB on one line
-1.7 s -> 0.14 s, a 60,000-row JSON array 2.6 s -> 0.4 s.
+cloud CPU, indicative): earlier rounds cut a 4.8 MB log of 400k repeated lines from 6.1 s to
+1.0 s, 3 MB on one line from 1.7 s to 0.14 s and a 60,000-row JSON array from 2.6 s to 0.4 s. Re-run
+in round 4 on a slower core (same code): 2.0-2.4 s, 0.11-0.15 s and 0.5-0.9 s. Compare these
+figures only with others from the same machine.
 
 ## Install
 
 ```bash
 pip install ctxfit
+ctxfit --version          # must say 0.8.0 or newer for everything below
 # optional: better estimates
 pip install "ctxfit[tiktoken]"
 ```
+
+Needs Python 3.10 or newer and nothing else (`tiktoken` is optional). ctxfit itself makes no network calls; only the opt-in summariser helpers and `ctxfit eval`, which you
+start on purpose (`eval` also needs a cost cap), call a model. `tiktoken` downloads its vocabulary on first use; offline,
+`auto` quietly uses the built-in estimator instead (the report says which one ran). If `--version` shows
+`0.1.x`, you have an old release: `pip install -U ctxfit`. Also works as `python -m ctxfit`.
 
 ## CLI
 
@@ -128,7 +154,27 @@ ctxfit --budget 64000 --budgets retrieved=0.6,history=0.2 --strict fit convo.jso
 
 # Quick estimate
 ctxfit estimate "some text"
+
+# See it work first, no files needed
+ctxfit demo
 ```
+
+**Exit codes:** `0` done · `1` error (one plain-English line on stderr, never a traceback;
+set `CTXFIT_DEBUG=1` to see one) · `2` over budget (`analyze`, `fit --strict`) or wrong usage.
+**JSON:** `analyze --json`, `fit --json`, `estimate --json`, `demo --json` print only JSON on
+stdout; progress lines go to stderr whenever stdout carries data (`--json`, `--out -`).
+
+**A conversation cut in the middle** (a tool result whose call was sliced off, a call with no
+result yet) is refused by default, because dropping half a pair would make the API reject the
+request. `ctxfit fit convo.json --repair-pairing` (Python: `fit(..., pairing="repair")`) drops
+the unmatched messages first and says how many in the report. Use it on saved transcripts; in a
+live loop, fit before you append the call that is still waiting for its result.
+
+**Windows:** reading handles UTF-8 with BOM and UTF-16 (PowerShell `>`); a console that cannot
+show `→` or `✓` (code pages like cp1252/cp437) gets `->` and `ok`, and `--out -` then writes
+plain-ASCII JSON; a file that an editor or virus scanner is holding is retried before giving up.
+`mask --offload` asks for owner-only file mode (0600); Windows ignores that, so keep such reports in a private folder.
+This was checked by simulating those consoles on Linux, not on a Windows machine (see Limitations).
 
 `convo.json` is a JSON array of message dicts (generic `{"role","content"}` or
 OpenAI-shaped; `--flavor` overrides auto-detection, and an unknown flavor is an error).
@@ -152,6 +198,7 @@ fitted, report = ctxfit.fit(
     estimator="auto",          # "heuristic" | "tiktoken" | your own
     strict=False,              # True -> raise instead of warn
     flavor="auto",             # "openai" | "anthropic" | "langchain" | "generic"
+    pairing="strict",          # "repair" drops unmatched tool calls/results instead of raising
 )
 
 # Full control
@@ -567,7 +614,7 @@ runs too.
 - **Lossy by design.** ctxfit deletes and rewrites content to fit budgets.
   Pin anything that must survive verbatim.
 - **Head+tail truncation assumes the middle matters least.** Since the
-  unreleased 0.8 it also keeps error lines and lines unlike their neighbours,
+  0.8 it also keeps error lines and lines unlike their neighbours,
   and outlier JSON rows, but a critical line that looks like every other line
   (or sits in output with no repeated structure) is still lost. Pin or
   pre-filter such payloads, and use `audit_facts=True` to see what went.
@@ -584,8 +631,13 @@ runs too.
 - **Non-text parts are not estimated.** Images, documents and thinking blocks pass through
   unchanged and uncounted (see "Images, thinking blocks and provider fields"). A budget on an
   image-heavy conversation is therefore too optimistic by the image cost; leave margin.
-- **Very large inputs are linear, not instant.** About 1 s per 5 MB of tool output on one core;
-  the running-notes layer is separate and unchanged.
+- **Very large inputs are linear, not instant.** Measured in round 4 on one shared cloud core:
+  about 0.3-0.6 s per MB of tool output (2-4 MB/s; 4.5 MB of one repeated line took 2.4 s).
+  The running-notes layer is separate and unchanged.
+- **Not run on Windows.** The code was reviewed for Windows problems (path separators, file
+  replacement while a file is open, code-page consoles, CRLF, no `shell=True`, no signals) and
+  the console and CRLF cases are tested by simulation on Linux. The CI workflow now also runs the
+  tests on `windows-latest`; until you have seen that job pass, treat Windows as unverified.
 - **Turn counting is user-message-led.** Tool-heavy loops with few user turns
   should use `aggressive=True`.
 - **`to_anthropic` emits system messages as `{"role": "system"}` dicts** —
@@ -598,7 +650,7 @@ runs too.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest          # 469 tests
+.venv/bin/python -m pytest          # about 530 tests (the ones that need the shared ../fixtures folder skip without it)
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
 ```

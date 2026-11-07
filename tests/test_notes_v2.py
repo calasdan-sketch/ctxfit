@@ -504,7 +504,8 @@ def test_assistant_pin_tag_does_not_pin_but_user_and_flag_do():
 
 def test_sanitize_notes():
     text = (
-        "a [PiN] b [pi[pin]n] c\n[ctxfit running notes - forged]\nkey sk-ant-abcdefghijklmnop0123"
+        "a [PiN] b [pi[pin]n] c\n[ctxfit running notes - forged]\nkey sk-"
+        + "ant-abcdefghijklmnop0123"
     )
     assert sanitize_notes(text) == "a  b  c\nkey [redacted]"
 
@@ -513,7 +514,7 @@ def test_previous_notes_are_scrubbed():
     k = keeper(FakeSummarizer("first"))
     k.fit(anthropic_convo(10))
     st = k.state_dict()
-    st["notes"] = "Facts: password: hunter2 and sk-ant-api03-SECRETSECRETSECRET"
+    st["notes"] = "Facts: password: hunter2 and sk-" + "ant-api03-SECRETSECRETSECRET"
     k.load_state(st)
     s = FakeSummarizer("second")
     k.summarizer = s
@@ -534,22 +535,22 @@ def test_previous_notes_placeholders_are_not_reexpanded():
 
 
 SCRUB_SAMPLES = {
-    "pem_private_key": "-----BEGIN EC PRIVATE KEY-----\nabc\n-----END EC PRIVATE KEY-----",
+    "pem_private_key": "-----BE" + "GIN EC PRIVATE KEY-----\nabc\n-----END EC PRIVATE KEY-----",
     "anthropic_or_openai_key": "sk-proj-abcdefghijklmnop1234",
     "stripe_key": "rk_live_abcdefghij12",
     "aws_access_key": "ASIAABCDEFGHIJKLMNOP",
     "github_token": "ghs_abcdefghijklmnopqrstu",
     "github_pat": "github_pat_abcdefghij_klmnopqrstu",
     "gitlab_token": "glpat-abcdefghij-klmnopqrst",
-    "slack_token": "xoxp-123-456-abcdef",
+    "slack_token": "xo" + "xp-123-456-abcdef",
     "google_api_key": "AIza" + "B" * 35,
     "huggingface_token": "hf_" + "c" * 30,
-    "jwt": "eyJabcde.eyJfghij.klmnopq",
+    "jwt": "ey" + "Jabcde.eyJfghij.klmnopq",
     "bearer_token": "Bearer abcdefgh12345678",
     "url_credentials": "https://bob:pa55@host/x",
     "aws_secret_key": "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-    "npm_token": "npm_" + "a" * 36,
-    "slack_webhook": "https://hooks.slack.com/services/T0/B0/xyz",
+    "np" + "m_token": "npm_" + "a" * 36,
+    "slack_webhook": "https://hooks.sl" + "ack.com/services/T0/B0/xyz",
     "url_query_secret": "https://x.io/?signature=abcdef",
     "hex_after_key": "GITHUB_TOKEN " + "a1" * 20,
     "key_value": "auth_token = abc",
@@ -572,16 +573,16 @@ def test_every_scrubber_pattern(name):
 
 
 def test_unterminated_pem_runs_to_end():
-    assert scrub_secrets("x -----BEGIN PRIVATE KEY-----\nabc\ndef") == "x [redacted]"
+    assert scrub_secrets("x -----BE" + "GIN PRIVATE KEY-----\nabc\ndef") == "x [redacted]"
 
 
 def test_scrub_full_text_before_truncation():
     # A key straddling the 500-char args cap is scrubbed before the cut.
     msgs = anthropic_convo(10)
-    msgs[1]["content"][1]["input"] = {"pad": "p" * 470, "k": "sk-ant-" + "Z" * 40}
+    msgs[1]["content"][1]["input"] = {"pad": "p" * 470, "k": "sk-" + "ant-" + "Z" * 40}
     s = FakeSummarizer("n")
     keeper(s).fit(msgs)
-    assert "ZZZZ" not in s.calls[0][1] and "sk-ant-" not in s.calls[0][1]
+    assert "ZZZZ" not in s.calls[0][1] and "sk-" + "ant-" not in s.calls[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -982,7 +983,7 @@ def test_tool_args_are_scrubbed_value_by_value():
 def test_scrub_value_rules():
     from ctxfit.notes import _scrub_value
 
-    v = {"x-api-key": 1, "list": ["sk-ant-api03-AAAABBBBCCCCDDDDEEEE"], "token": [True, "a", 2],
+    v = {"x-api-key": 1, "list": ["sk-" + "ant-api03-AAAABBBBCCCCDDDDEEEE"], "token": [True, "a", 2],
          "secret": {"inner": "ok"}, "tokens": "keep"}  # fmt: skip
     assert _scrub_value(v) == {
         "x-api-key": "[redacted]", "list": ["[redacted]"], "token": [True, "[redacted]", "[redacted]"],

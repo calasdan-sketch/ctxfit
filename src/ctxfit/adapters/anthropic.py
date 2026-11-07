@@ -27,7 +27,12 @@ def _blocks_to_parts(
     blocks: Sequence[dict[str, Any]], src_index: int, role: str, section: str, pinned: bool
 ) -> list[Message]:
     out: list[Message] = []
-    for b in blocks:
+    for j, b in enumerate(blocks):
+        if not isinstance(b, dict):
+            raise TypeError(
+                f"message #{src_index}: content block #{j} must be an object like "
+                f'{{"type": "text", "text": "..."}}, got {type(b).__name__}'
+            )
         btype = b.get("type")
         meta = {"src_index": src_index, "src": "anthropic"}
         if btype == "tool_use":

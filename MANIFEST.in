@@ -1,0 +1,5 @@
+include LICENSE CHANGELOG.md README.md
+recursive-include benchmarks *.py *.md
+recursive-include docs *.json
+prune build
+global-exclude __pycache__ *.pyc

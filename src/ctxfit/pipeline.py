@@ -16,6 +16,7 @@ from .messages import (
     normalize,
     printable,
     raw_passthrough,
+    repair_pairing,
     validate_pairing,
     with_extras,
 )
@@ -49,6 +50,9 @@ class FitReport:
     # thinking blocks, cache_control marks or other parts the text model
     # cannot represent. Their non-text parts are not counted in the estimates.
     passthrough_messages: int = 0
+    # ``pairing="repair"``: unmatched tool_call / tool_result messages dropped before fitting.
+    pairing_repaired: int = 0
+    pairing_repairs: list[str] = field(default_factory=list)
 
     @property
     def total_before(self) -> int:
@@ -102,8 +106,13 @@ class FitReport:
         if self.passthrough_messages:
             lines.append(
                 f"note: {self.passthrough_messages} message(s) hold images, thinking blocks or "
-                "other non-text parts; kept unchanged and pinned, and those parts are not "
-                "counted in the estimates"
+                "other non-text parts; handed back unchanged (not rewritten), and those parts "
+                "are not counted in the estimates"
+            )
+        if self.pairing_repaired:
+            lines.append(
+                f"note: dropped {self.pairing_repaired} unmatched tool_call/tool_result "
+                "message(s) first (pairing='repair')"
             )
         if self.facts_seen is not None:
             if self.facts_lost_count:
@@ -133,6 +142,8 @@ class FitReport:
             "facts_lost_count": self.facts_lost_count,
             "facts_lost": self.facts_lost,
             "passthrough_messages": self.passthrough_messages,
+            "pairing_repaired": self.pairing_repaired,
+            "pairing_repairs": self.pairing_repairs,
             "warnings": [str(w) for w in self.warnings],
             "strategies": [
                 {
@@ -190,7 +201,11 @@ class FitPipeline:
         aggressive: bool = False,
         audit_facts: bool = False,
         offload: MutableMapping[str, str] | None = None,
+        pairing: str = "strict",
     ) -> None:
+        if pairing not in ("strict", "repair"):
+            raise ValueError(f"unknown pairing mode {pairing!r}; expected 'strict' or 'repair'")
+        self.pairing = pairing
         self.audit_facts = audit_facts
         self.offload = offload
         if strategies is None:
@@ -219,13 +234,22 @@ class FitPipeline:
 
     def _fit_messages(self, messages: Sequence[Message]) -> tuple[list[Message], FitReport]:
         current = list(messages)
+        repairs: list[str] = []
+        original = current
+        if self.pairing == "repair":
+            current, repairs = repair_pairing(current)
         input_problems = validate_pairing(current)
         if input_problems:
             raise PairingBroken(
                 "input messages already break tool_call/tool_result pairing: "
                 + "; ".join(input_problems)
+                + (
+                    " (pairing='repair' drops the unmatched ones)"
+                    if self.pairing == "strict"
+                    else ""
+                )
             )
-        before = count_by_section(current, self.estimator)
+        before = count_by_section(original, self.estimator)
         strategy_reports: list[StrategyReport] = []
 
         for strategy in self.strategies:
@@ -261,6 +285,8 @@ class FitPipeline:
             facts_lost=lost[:20],
             facts_lost_count=len(lost),
             passthrough_messages=count_opaque(current),
+            pairing_repaired=len(repairs),
+            pairing_repairs=repairs[:20],
             tokens_before=before,
             tokens_after=after,
             strategy_reports=strategy_reports,
@@ -323,6 +349,7 @@ def fit(
     flavor: str = "auto",
     audit_facts: bool = False,
     offload: MutableMapping[str, str] | None = None,
+    pairing: str = "strict",
 ) -> tuple[list[Any], FitReport]:
     """One-call API: fit raw messages within budget.
 
@@ -332,6 +359,9 @@ def fit(
     offload: pass a dict to keep the full text of every truncated tool output
     (``{id: text}``, id = :func:`ctxfit.output_id`); the cut marker names the id so your
     loop can serve the original back when the model asks for it.
+
+    pairing: ``"strict"`` (default) raises :class:`PairingBroken` when a tool call has no result
+    or the reverse; ``"repair"`` drops those unmatched messages first and says so in the report.
 
     Note: token figures are estimates (heuristic ±~25%). Budget 80-90% of
     your model's true context window as a safety margin.
@@ -354,5 +384,6 @@ def fit(
         aggressive=aggressive,
         audit_facts=audit_facts,
         offload=offload,
+        pairing=pairing,
     )
     return pipeline.fit(raw, flavor=flavor)

@@ -105,6 +105,7 @@ _WORD_RE = re.compile(r"[A-Za-z]+")
 _LONG_WORD_RE = re.compile(r"[A-Za-z]{8,}")
 _DIGITS_RE = re.compile(r"\d+")
 _ASCII_NONPUNCT_RE = re.compile(r"[ \t\n\r\f\v\x1c-\x1f0-9A-Za-z]+")
+_NONPUNCT_RE = re.compile(r"[\s0-9A-Za-z]+")
 _EMOJI_RE = re.compile("[\U0001f000-\U0001faff\u2600-\u27bf]")
 
 
@@ -144,10 +145,10 @@ class PieceEstimator:
             total += math.ceil(len(w) / 7) - 1
         for d in _DIGITS_RE.findall(text):
             total += math.ceil(len(d) / 2)
-        if text.isascii():  # same number as the per-character loop below, in C
-            punct = len(_ASCII_NONPUNCT_RE.sub("", text))
-        else:
-            punct = sum(1 for ch in text if not (ch.isspace() or ch.isalnum() and ch.isascii()))
+        # Characters that are neither whitespace nor an ASCII letter/digit. One regex pass in C
+        # for any text (a per-character Python loop was 10x slower, and any non-ASCII marker such
+        # as "…" in a cut tool output sent the whole text down that path).
+        punct = len((_ASCII_NONPUNCT_RE if text.isascii() else _NONPUNCT_RE).sub("", text))
         total += 0.7 * (punct - emoji) + 2.0 * emoji
         total += 0.6 * text.count("\n") + cjk * 1.5
         return max(1, math.ceil(total))
@@ -168,12 +169,20 @@ class TiktokenEstimator:
             raise ImportError(
                 "tiktoken is not installed; pip install tiktoken or use estimator='heuristic'"
             ) from exc
-        self._enc = tiktoken.get_encoding(encoding)
+        try:
+            self._enc = tiktoken.get_encoding(encoding)
+        except Exception as exc:  # tiktoken downloads its vocabulary on first use
+            raise ImportError(
+                f"tiktoken is installed but could not load {encoding!r} ({type(exc).__name__}). "
+                "It downloads the vocabulary the first time; offline? Point TIKTOKEN_CACHE_DIR "
+                "at a folder that already has it, or use estimator='pieces'"
+            ) from exc
 
     def count(self, text: str) -> int:
         if not text:
             return 0
-        return max(1, len(self._enc.encode(text)))
+        # Text such as "<|endoftext|>" in a tool output is ordinary text here, not an error.
+        return max(1, len(self._enc.encode(text, disallowed_special=())))
 
     def count_message(self, msg: Message) -> int:
         return self.count(msg.content) + PER_MESSAGE_OVERHEAD

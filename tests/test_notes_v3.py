@@ -184,7 +184,7 @@ def test_handle_recall_both_flavors():
 # panel review fixes
 # ---------------------------------------------------------------------------
 
-ANT = "sk-ant-api03-" + "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"
+ANT = "sk-" + "ant-api03-" + "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"
 
 
 def _filler(n):

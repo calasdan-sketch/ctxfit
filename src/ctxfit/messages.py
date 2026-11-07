@@ -380,6 +380,48 @@ def validate_pairing(messages: Sequence[Message]) -> list[str]:
     return problems
 
 
+def repair_pairing(messages: Sequence[Message]) -> tuple[list[Message], list[str]]:
+    """Drop what breaks the pair-atomicity invariant; return ``(kept, what_was_dropped)``.
+
+    A conversation that was cut in the middle (a tool result whose call was sliced off, a call
+    whose result has not arrived yet) or that repeats a tool id cannot be fitted safely. This
+    removes the unmatched tool_call / tool_result messages and the second and later users of a
+    repeated id. Nothing else is touched. A message that also holds images or other non-text
+    parts is never dropped here: the caller gets a :class:`ValueError` instead (fail closed).
+    """
+    first_call: dict[str, int] = {}
+    first_result: dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if m.call_id and m.kind == KIND_TOOL_CALL:
+            first_call.setdefault(m.call_id, i)
+        elif m.call_id and m.kind == KIND_TOOL_RESULT:
+            first_result.setdefault(m.call_id, i)
+    kept: list[Message] = []
+    dropped: list[str] = []
+    for i, m in enumerate(messages):
+        why = ""
+        if m.call_id and m.kind == KIND_TOOL_CALL:
+            if first_call[m.call_id] != i:
+                why = "repeated tool_call id"
+            elif m.call_id not in first_result:
+                why = "tool_call with no tool_result"
+        elif m.call_id and m.kind == KIND_TOOL_RESULT:
+            if first_result[m.call_id] != i:
+                why = "repeated tool_result id"
+            elif m.call_id not in first_call:
+                why = "tool_result with no tool_call"
+        if not why:
+            kept.append(m)
+            continue
+        if "ctxfit_raw" in m.meta:
+            raise ValueError(
+                f"message #{i} ({why}, id {printable(str(m.call_id), 60)!r}) also holds images or "
+                "other non-text parts, so ctxfit will not drop it; fix the conversation first"
+            )
+        dropped.append(f"#{i}: {why}, id {printable(str(m.call_id), 60)!r}")
+    return kept, dropped
+
+
 def turn_indexes(messages: Sequence[Message]) -> list[int]:
     """Assign each message a turn index.
 
