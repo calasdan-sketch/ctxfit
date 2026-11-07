@@ -163,9 +163,13 @@ def test_validate_pairing_duplicate_result_ids():
 
 def test_fit_rejects_duplicate_call_ids():
     raw = [
-        {"role": "assistant", "content": None,
-         "tool_calls": [{"id": "c1", "type": "function",
-                         "function": {"name": "f", "arguments": "{}"}}]},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
         {"role": "tool", "content": "ok", "tool_call_id": "c1"},
         {"role": "tool", "content": "ok again", "tool_call_id": "c1"},
     ]

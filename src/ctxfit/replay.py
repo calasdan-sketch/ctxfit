@@ -260,7 +260,9 @@ def _blocks(content: Any) -> list[Any]:
         return list(content)
     if content is None or content == "":
         return []
-    return [{"type": "text", "text": content if isinstance(content, str) else canonical_json(content)}]
+    return [
+        {"type": "text", "text": content if isinstance(content, str) else canonical_json(content)}
+    ]
 
 
 _BLANK_LINE = re.compile(r"[ \t\n\r\f\v]*")

@@ -15,6 +15,7 @@ back ``Message`` objects with ``meta`` and every other field kept, only
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -169,6 +170,148 @@ def detect_flavor(raw: Sequence[Any]) -> str:
     return "generic"
 
 
+_ZERO_WIDTH = "\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
+_UNSAFE_KEEP_WS_RE = re.compile(f"[\x00-\x08\x0b-\x1f\x7f-\x9f{_ZERO_WIDTH}]")
+_UNSAFE_ALL_RE = re.compile(f"[\x00-\x1f\x7f-\x9f{_ZERO_WIDTH}]")
+
+
+def printable(text: str, limit: int | None = None) -> str:
+    """Untrusted text made safe to print: control, bidi and zero-width characters become \\uXXXX.
+
+    With ``limit`` only the first ``limit`` characters are used and the result is one line
+    (newlines and tabs are escaped too); without it newlines and tabs are kept.
+    """
+    if limit is None:
+        return _UNSAFE_KEEP_WS_RE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+    return _UNSAFE_ALL_RE.sub(lambda m: f"\\u{ord(m.group()):04x}", text[:limit])
+
+
+_KNOWN_KEYS = frozenset(
+    {
+        "role",
+        "content",
+        "tool_calls",
+        "tool_call_id",
+        "name",
+        "pinned",
+        "section",
+        "kind",
+        "call_id",
+    }
+)
+_PLAIN_TEXT = frozenset({"type", "text"})
+_CTX_KEYS = ("pinned", "section", "kind", "call_id")  # ctxfit's own directives; never handed back
+
+
+def _is_opaque(m: Any) -> bool:
+    """True when a raw message carries parts the canonical text form cannot hold.
+
+    Images, documents, thinking blocks (with signatures), cache_control marks, extra fields on
+    content blocks or tool calls (for example a provider's thought signature). Rebuilding such a
+    message from text would silently delete them, so ctxfit keeps the original: strategies do not
+    rewrite it (it can still be dropped whole) and it is handed back unchanged.
+    """
+    if not isinstance(m, dict):
+        return False
+    content = m.get("content")
+    if content is not None and not isinstance(content, (str, list)):
+        return True  # numbers, objects: not text, so not ours to restate
+    if isinstance(content, list):
+        for p in content:
+            if not isinstance(p, dict):
+                return True
+            t = p.get("type")
+            if t in ("text", "input_text"):
+                if set(p) - _PLAIN_TEXT:
+                    return True
+            elif t == "tool_use":
+                if set(p) - {"type", "id", "name", "input"}:
+                    return True
+            elif t == "tool_result":
+                if set(p) - {"type", "tool_use_id", "content", "is_error"}:
+                    return True
+                inner = p.get("content")
+                if isinstance(inner, list) and any(
+                    not (
+                        isinstance(q, dict) and q.get("type") == "text" and not set(q) - _PLAIN_TEXT
+                    )
+                    for q in inner
+                ):
+                    return True
+            else:
+                return True
+    calls = m.get("tool_calls")
+    if isinstance(calls, list):
+        for tc in calls:
+            if not isinstance(tc, dict) or set(tc) - {"id", "type", "function"}:
+                return True
+            fn = tc.get("function")
+            if isinstance(fn, dict) and set(fn) - {"name", "arguments"}:
+                return True
+    return False
+
+
+def _mark_opaque(raw: Sequence[Any], out: list[Message]) -> list[Message]:
+    """Record, per source message, what a rebuild would lose (see :func:`raw_passthrough`)."""
+    counts: dict[int, int] = {}
+    for msg in out:
+        i = msg.meta.get("src_index")
+        if isinstance(i, int):
+            counts[i] = counts.get(i, 0) + 1
+    for msg in out:
+        i = msg.meta.get("src_index")
+        if not (isinstance(i, int) and 0 <= i < len(raw) and isinstance(raw[i], dict)):
+            continue
+        src = raw[i]
+        if _is_opaque(src):
+            msg.meta["ctxfit_raw"] = src
+            msg.meta["ctxfit_orig"] = msg.content
+            msg.meta["ctxfit_nparts"] = counts[i]
+        extras = {k: v for k, v in src.items() if k not in _KNOWN_KEYS or k == "name"}
+        if extras:
+            msg.meta["ctxfit_extras"] = extras
+    return out
+
+
+def raw_passthrough(parts: Sequence[Message]) -> dict[str, Any] | None:
+    """The original message dict for an opaque source nobody changed, else None."""
+    first = parts[0]
+    raw = first.meta.get("ctxfit_raw")
+    if raw is None or len(parts) != first.meta.get("ctxfit_nparts"):
+        return None
+    if any(
+        p.meta.get("ctxfit_raw") is not raw or p.content != p.meta.get("ctxfit_orig") for p in parts
+    ):
+        return None
+    import copy
+
+    d = copy.deepcopy(raw)
+    for k in _CTX_KEYS:
+        d.pop(k, None)
+    return d
+
+
+def with_extras(d: dict[str, Any], parts: Sequence[Message]) -> dict[str, Any]:
+    """Add back the provider fields ctxfit does not model (``refusal``, ``reasoning_content``, ...)."""
+    extras = parts[0].meta.get("ctxfit_extras")
+    if extras:
+        import copy
+
+        for k, v in extras.items():
+            d.setdefault(k, copy.deepcopy(v))
+    return d
+
+
+def is_opaque_message(m: Message) -> bool:
+    """True for a message ctxfit must not rewrite (it carries non-text parts)."""
+    return "ctxfit_raw" in m.meta
+
+
+def count_opaque(messages: Sequence[Message]) -> int:
+    """How many source messages are being passed through unchanged (see :func:`_is_opaque`)."""
+    return len({id(m.meta["ctxfit_raw"]) for m in messages if "ctxfit_raw" in m.meta})
+
+
 def normalize(raw: Sequence[Any], flavor: str = "auto") -> list[Message]:
     """Normalize any supported input into canonical Messages.
 
@@ -179,19 +322,23 @@ def normalize(raw: Sequence[Any], flavor: str = "auto") -> list[Message]:
         return list(raw)  # type: ignore[arg-type]
     if flavor == "auto":
         flavor = detect_flavor(raw)
+    if flavor not in ("openai", "anthropic", "langchain", "generic"):
+        raise ValueError(
+            f"unknown flavor {flavor!r}; expected 'auto', 'openai', 'anthropic', 'langchain' or 'generic'"
+        )
     if flavor == "openai":
         from .adapters.openai import from_openai
 
-        return from_openai(raw)  # type: ignore[arg-type]
+        return _mark_opaque(raw, from_openai(raw))  # type: ignore[arg-type]
     if flavor == "anthropic":
         from .adapters.anthropic import from_anthropic
 
-        return from_anthropic(raw)  # type: ignore[arg-type]
+        return _mark_opaque(raw, from_anthropic(raw))  # type: ignore[arg-type]
     if flavor == "langchain":
         from .adapters.langchain import from_lc_messages
 
         return from_lc_messages(raw)
-    return from_dicts(raw)  # type: ignore[arg-type]
+    return _mark_opaque(raw, from_dicts(raw))  # type: ignore[arg-type]
 
 
 def validate_pairing(messages: Sequence[Message]) -> list[str]:

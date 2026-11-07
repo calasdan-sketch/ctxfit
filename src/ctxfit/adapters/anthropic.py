@@ -18,6 +18,8 @@ from ..messages import (
     KIND_TOOL_RESULT,
     Message,
     assign_section,
+    raw_passthrough,
+    with_extras,
 )
 
 
@@ -114,6 +116,10 @@ def to_anthropic(messages: Sequence[Message]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for src in order:
         parts = grouped[src]
+        kept = raw_passthrough(parts)
+        if kept is not None:
+            out.append(kept)
+            continue
         # Anthropic role: assistant if any assistant/tool_call part, else user.
         # (System messages are top-level in the real API; we keep them as
         # role "system" dicts and let the caller hoist them.)
@@ -147,7 +153,11 @@ def to_anthropic(messages: Sequence[Message]) -> list[dict[str, Any]]:
             else:
                 blocks.append({"type": "text", "text": p.content})
         if role == "system" and all(b.get("type") == "text" for b in blocks):
-            out.append({"role": "system", "content": "\n".join(b["text"] for b in blocks)})
+            out.append(
+                with_extras(
+                    {"role": "system", "content": "\n".join(b["text"] for b in blocks)}, parts
+                )
+            )
         else:
-            out.append({"role": role, "content": blocks})
+            out.append(with_extras({"role": role, "content": blocks}, parts))
     return out

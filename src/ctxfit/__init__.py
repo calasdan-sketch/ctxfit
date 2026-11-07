@@ -38,6 +38,7 @@ from .strategies import (
     StrategyContext,
     StrategyReport,
     TruncateToolOutput,
+    output_id,
 )
 
 __version__ = "0.7.0"
@@ -70,6 +71,7 @@ __all__ = [
     "TiktokenEstimator",
     "TokenEstimator",
     "TruncateToolOutput",
+    "output_id",
     "__version__",
     "anthropic_summarizer",
     "finish_context",

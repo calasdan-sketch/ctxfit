@@ -21,6 +21,8 @@ from ..messages import (
     KIND_TOOL_RESULT,
     Message,
     assign_section,
+    raw_passthrough,
+    with_extras,
 )
 
 
@@ -145,6 +147,11 @@ def to_openai(messages: Sequence[Message]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for src in order:
         parts = grouped[src]
+        kept = raw_passthrough(parts)
+        if kept is not None:
+            out.append(kept)
+            continue
+        start = len(out)
         first = parts[0]
         if first.role == "assistant" and any(p.kind == KIND_TOOL_CALL for p in parts):
             text_parts = [p.content for p in parts if p.kind == KIND_TEXT]
@@ -168,8 +175,10 @@ def to_openai(messages: Sequence[Message]) -> list[dict[str, Any]]:
             # markers); emit each in order.
             for p in parts:
                 out.append(_single_to_openai(p))
+        for item in out[start:]:
+            with_extras(item, parts)
     for m in ungrouped:
-        out.append(_single_to_openai(m))
+        out.append(with_extras(_single_to_openai(m), [m]))
     return out
 
 

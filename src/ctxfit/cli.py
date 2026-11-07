@@ -8,13 +8,64 @@ import os
 import sys
 from typing import Any
 
-from .budgets import Budget
+from .budgets import Budget, BudgetOverflow
 from .pipeline import FitPipeline
 
 
+def _decode(raw: bytes) -> str:
+    """Text of a file as Windows tools write it: UTF-8 with or without BOM, or UTF-16/32 with BOM."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):  # PowerShell 5 `>` writes UTF-16 LE with BOM
+        if raw.startswith(b"\xff\xfe\x00\x00"):
+            return raw.decode("utf-32")
+        return raw.decode("utf-16")
+    return raw.decode("utf-8-sig")
+
+
+def _read(path: str) -> str:
+    """File text; ``-`` reads standard input."""
+    if path == "-":
+        return _decode(sys.stdin.buffer.read())
+    with open(path, "rb") as fh:
+        return _decode(fh.read())
+
+
+def _write(path: str, text: str, private: bool = False) -> None:
+    """Write a file all at once (a failure never leaves a half-written one); ``-`` is stdout."""
+    if path == "-":
+        sys.stdout.write(text)
+        return
+    target = os.path.realpath(path)
+    tmp = f"{target}.ctxfit-{os.getpid()}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if private else 0o666)
+    except OSError:  # directory not writable: fall back to writing the file itself
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o666)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        if private:
+            os.chmod(target, 0o600)
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        if private:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _note(msg: str, out: str | None) -> None:
+    """Progress lines go to stderr when stdout carries the data (``--out -``)."""
+    print(msg, file=sys.stderr if out == "-" else sys.stdout)
+
+
 def _load(path: str) -> list[Any]:
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
+    data = json.loads(_read(path))
     if isinstance(data, dict) and "messages" in data:
         data = data["messages"]
     if not isinstance(data, list):
@@ -83,16 +134,20 @@ def _print_table(info: dict[str, Any]) -> None:
 def cmd_fit(args: argparse.Namespace) -> int:
     raw = _load(args.input)
     pipeline = _build_pipeline(args)
-    fitted, report = pipeline.fit(raw, flavor=args.flavor)
+    if args.out == "-" and args.report == "-":
+        raise ValueError("--out - and --report - would both use standard output")
+    try:
+        fitted, report = pipeline.fit(raw, flavor=args.flavor)
+    except BudgetOverflow as exc:  # --strict
+        print(f"ctxfit: {exc}", file=sys.stderr)
+        return 2
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(fitted, fh, indent=2, ensure_ascii=False)
-        print(f"wrote {args.out}")
+        _write(args.out, json.dumps(fitted, indent=2, ensure_ascii=False) + "\n")
+        _note(f"wrote {args.out}", args.out)
     if args.report:
-        with open(args.report, "w", encoding="utf-8") as fh:
-            json.dump(report.to_dict(), fh, indent=2)
-        print(f"wrote {args.report}")
-    print(report.summary())
+        _write(args.report, json.dumps(report.to_dict(), indent=2) + "\n")
+        _note(f"wrote {args.report}", args.out)
+    print(report.summary(), file=sys.stderr if args.out == "-" else sys.stdout)
     return 2 if report.over_budget else 0
 
 
@@ -108,22 +163,14 @@ def cmd_mask(args: argparse.Namespace) -> int:
         flavor=args.flavor,
     )
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            json.dump(masked, fh, indent=2, ensure_ascii=False)
-        print(f"wrote {args.out}")
+        _write(args.out, json.dumps(masked, indent=2, ensure_ascii=False) + "\n")
+        _note(f"wrote {args.out}", args.out)
     if args.report:
         data = report.to_dict(include_offload=args.offload)
-        if args.offload:
-            # The report then holds the original tool outputs: owner-only.
-            fd = os.open(args.report, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            os.chmod(args.report, 0o600)
-            fh = os.fdopen(fd, "w", encoding="utf-8")
-        else:
-            fh = open(args.report, "w", encoding="utf-8")
-        with fh:
-            json.dump(data, fh, indent=2)
-        print(f"wrote {args.report}")
-    print(report.summary())
+        # With --offload the report holds the original tool outputs: owner-only.
+        _write(args.report, json.dumps(data, indent=2) + "\n", private=bool(args.offload))
+        _note(f"wrote {args.report}", args.out)
+    print(report.summary(), file=sys.stderr if args.out == "-" else sys.stdout)
     return 0
 
 
@@ -136,8 +183,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
     )
     text = dumps(report) if args.json else summary(report) + "\n"
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
-            fh.write(dumps(report))
+        _write(args.out, dumps(report))
         print(f"wrote {args.out}")
     sys.stdout.write(text)
     return 0
@@ -180,9 +226,7 @@ def cmd_badge(args: argparse.Namespace) -> int:
     from .proof import badge
 
     data = badge(args.corpus or None)
-    with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
+    _write(args.out, json.dumps(data, indent=2) + "\n")
     print(f"wrote {args.out}: {data['message']}")
     return 0
 
@@ -193,8 +237,7 @@ def cmd_estimate(args: argparse.Namespace) -> int:
     est = get_estimator(args.estimator)
     text = args.text
     if args.file:
-        with open(args.file, encoding="utf-8") as fh:
-            text = fh.read()
+        text = _read(args.file)
     print(f"{est.count(text):,} est. tokens [{getattr(est, 'name', '?')}] ({len(text):,} chars)")
     return 0
 
@@ -345,7 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (ValueError, TypeError, FileNotFoundError, ImportError) as exc:
+    except (ValueError, TypeError, OSError, ImportError) as exc:
         print(f"ctxfit: error: {exc}", file=sys.stderr)
         return 1
 

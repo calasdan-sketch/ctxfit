@@ -15,9 +15,10 @@ Hard safety rules enforced here, not left to callers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ from .messages import (
     KIND_TOOL_CALL,
     KIND_TOOL_RESULT,
     Message,
+    is_opaque_message,
     turn_indexes,
 )
 
@@ -49,6 +51,14 @@ class StrategyContext:
     budget: Budget
     ledger: BudgetLedger
     aggressive: bool = False
+    # Optional mapping that receives the full text of every tool output a strategy cuts,
+    # keyed by output_id(text); the cut marker then names that id (see ``fit(offload=...)``).
+    offload: MutableMapping[str, str] | None = None
+
+
+def output_id(text: str) -> str:
+    """The 8-hex id of a tool output (first 8 hex of its sha256), the same id running notes use."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:8]
 
 
 @dataclass
@@ -170,6 +180,7 @@ class Deduplicate(Strategy):
             if (
                 m.kind in (KIND_TEXT, KIND_TOOL_RESULT)
                 and not m.pinned
+                and not is_opaque_message(m)
                 and len(m.content) >= self.min_chars
             ):
                 key = f"{m.kind}:{_norm_text(m.content)}"
@@ -197,6 +208,55 @@ class Deduplicate(Strategy):
         return out, report
 
 
+class _Lit(float):
+    """A JSON float that remembers how it was written (``0.10`` stays ``0.10``, ``1e400`` stays)."""
+
+    text: str
+
+    def __new__(cls, text: str) -> _Lit:
+        obj = float.__new__(cls, text)
+        obj.text = text
+        return obj
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _no_dup_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    d: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in d:
+            raise _DuplicateKey(k)
+        d[k] = v
+    return d
+
+
+def _loads_exact(text: str) -> Any:
+    """json.loads that keeps number spelling and refuses duplicate keys (they would lose data)."""
+    return json.loads(text, parse_float=_Lit, object_pairs_hook=_no_dup_pairs)
+
+
+def _jd(v: Any) -> str:
+    """Compact JSON text of a parsed value, with numbers as originally written."""
+    if isinstance(v, _Lit):
+        return v.text
+    if isinstance(v, dict):
+        return (
+            "{"
+            + ", ".join(f"{json.dumps(k, ensure_ascii=False)}: {_jd(x)}" for k, x in v.items())
+            + "}"
+        )
+    if isinstance(v, list):
+        return "[" + ", ".join(_jd(x) for x in v) + "]"
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _one_line(s: str) -> str:
+    """No line break survives in a table cell or flat value (a value cannot forge a new row)."""
+    return re.sub(r"[\r\n\u2028\u2029\x0b\x0c\x85]+", " ", s)
+
+
 def _outlier_rows(data: list[dict[str, Any]], keys: list[str], skip: int, limit: int) -> list[int]:
     """Indexes (>= ``skip``) of rows that differ from an otherwise uniform column.
 
@@ -210,7 +270,7 @@ def _outlier_rows(data: list[dict[str, Any]], keys: list[str], skip: int, limit:
         return []
     flags: dict[int, int] = {}
     for k in keys:
-        col = [json.dumps(r[k], sort_keys=True, ensure_ascii=False) for r in data]
+        col = [_jd(r[k]) for r in data]
         freq: dict[str, int] = {}
         for v in col:
             freq[v] = freq.get(v, 0) + 1
@@ -239,11 +299,17 @@ def _json_table(data: list[dict[str, Any]], max_rows: int, max_outliers: int = 1
         return None
 
     def cell(v: Any) -> str:
-        s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-        s = str(s).replace("|", "\\|").replace("\n", " ")
+        s = v if isinstance(v, str) else _jd(v)
+        s = _one_line(str(s).replace("|", "\\|"))
         return s if len(s) <= 120 else s[:117] + "…"
 
-    lines = ["| " + " | ".join(keys) + " |", "| " + " | ".join("---" for _ in keys) + " |"]
+    def head(k: str) -> str:
+        return _one_line(k.replace("|", "\\|"))
+
+    lines = [
+        "| " + " | ".join(head(k) for k in keys) + " |",
+        "| " + " | ".join("---" for _ in keys) + " |",
+    ]
     rows = data[:max_rows]
     for r in rows:
         lines.append("| " + " | ".join(cell(r[k]) for k in keys) + " |")
@@ -260,6 +326,11 @@ def _json_table(data: list[dict[str, Any]], max_rows: int, max_outliers: int = 1
     return "\n".join(lines)
 
 
+def _scalar(v: Any) -> str:
+    """A leaf as JSON spells it (``true``/``null``, not Python's ``True``/``None``); strings bare."""
+    return v if isinstance(v, str) else _jd(v)
+
+
 def _json_flat(data: dict[str, Any], max_keys: int, max_depth: int) -> str | None:
     lines: list[str] = []
 
@@ -270,11 +341,13 @@ def _json_flat(data: dict[str, Any], max_keys: int, max_depth: int) -> str | Non
             for k, v in obj.items():
                 walk(v, f"{path}.{k}" if path else str(k), depth + 1)
         elif isinstance(obj, list) and obj and all(not isinstance(x, (dict, list)) for x in obj):
-            lines.append(f"- {path}: [{', '.join(str(x) for x in obj[:10])}]")
+            lines.append(
+                f"- {_one_line(path)}: [{', '.join(_one_line(_scalar(x)) for x in obj[:10])}]"
+            )
         elif isinstance(obj, (dict, list)):
-            lines.append(f"- {path}: {json.dumps(obj, ensure_ascii=False)[:200]}")
+            lines.append(f"- {_one_line(path)}: {_jd(obj)[:200]}")
         else:
-            lines.append(f"- {path}: {obj}")
+            lines.append(f"- {_one_line(path)}: {_one_line(_scalar(obj))}")
 
     walk(data, "", 0)
     if not lines:
@@ -313,19 +386,19 @@ class CompactJson(Strategy):
     def _apply(self, messages, ctx, report):
         out: list[Message] = []
         for i, m in enumerate(messages):
-            if m.kind not in (KIND_TEXT, KIND_TOOL_RESULT) or m.pinned:
+            if m.kind not in (KIND_TEXT, KIND_TOOL_RESULT) or m.pinned or is_opaque_message(m):
                 out.append(m)
                 continue
             compacted: str | None = None
             try:
-                data = json.loads(m.content.strip())
-            except (json.JSONDecodeError, ValueError):
+                data = _loads_exact(m.content.strip())
+                if isinstance(data, list):
+                    compacted = _json_table(data, self.max_rows, self.max_outliers)
+                elif isinstance(data, dict):
+                    compacted = _json_flat(data, self.max_keys, self.max_depth)
+            except (ValueError, RecursionError):  # not JSON, duplicate keys, or nested too deep
                 out.append(m)
                 continue
-            if isinstance(data, list):
-                compacted = _json_table(data, self.max_rows, self.max_outliers)
-            elif isinstance(data, dict):
-                compacted = _json_flat(data, self.max_keys, self.max_depth)
             if not compacted:
                 out.append(m)
                 continue
@@ -357,12 +430,13 @@ class CompactJson(Strategy):
 
 
 _TEMPLATE_NUM_RE = re.compile(r"0x[0-9a-fA-F]+|[0-9a-fA-F]{8,}|\d+")
+_WS_RE = re.compile(r"\s+")
 _LINE_CAP = 300
 
 
 def _line_template(line: str) -> str:
     """The line with numbers/hex ids blanked, so 'same kind of line' compares equal."""
-    return re.sub(r"\s+", " ", _TEMPLATE_NUM_RE.sub("#", line.strip()))
+    return _WS_RE.sub(" ", _TEMPLATE_NUM_RE.sub("#", line.strip()))
 
 
 def salient_lines(middle: str, budget_chars: int, max_lines: int = 20) -> list[tuple[int, str]]:
@@ -379,7 +453,13 @@ def salient_lines(middle: str, budget_chars: int, max_lines: int = 20) -> list[t
     lines = middle.split("\n")
     if len(lines) < 3:
         return []
-    templates = [_line_template(ln) for ln in lines]
+    seen_tpl: dict[str, str] = {}  # repeated lines (logs) are templated once
+    templates = []
+    for ln in lines:
+        t = seen_tpl.get(ln)
+        if t is None:
+            t = seen_tpl[ln] = _line_template(ln)
+        templates.append(t)
     counts: dict[str, int] = {}
     for t in templates:
         if t:
@@ -471,6 +551,7 @@ class TruncateToolOutput(Strategy):
             if (
                 not self._eligible(m)
                 or (m.pinned and not self.truncate_pinned)
+                or is_opaque_message(m)
                 or len(m.content) <= self.max_chars
             ):
                 out.append(m)
@@ -485,6 +566,11 @@ class TruncateToolOutput(Strategy):
                 f"truncated — kept {self.head_chars:,} head + {self.tail_chars:,} tail chars, "
                 f"omitted {omitted:,} chars (~{omitted_tokens:,} est. tokens)"
             )
+            oid = ""
+            if ctx.offload is not None:
+                oid = output_id(m.content)
+                ctx.offload[oid] = m.content
+                marker = marker[:-1] + f" — full text id {oid}]"
             new_content = head + "\n" + marker + "\n" + tail
             if self.salient and self.salient_chars:
                 middle = m.content[self.head_chars : len(m.content) - self.tail_chars]

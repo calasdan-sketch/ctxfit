@@ -7,6 +7,7 @@ is still in the result, and time per case. No network, no paid API.
 
     python benchmarks/needle_bench.py            # ctxfit variants (+ any competitor installed)
     python benchmarks/needle_bench.py --scale    # fit() time vs conversation length
+    python benchmarks/needle_bench.py --big      # fit() time on one huge tool output (default estimator)
 
 Competitors are used only if importable in this Python: langchain-core
 (trim_messages), headroom-ai (headroom.compress), llmlingua (LLMLingua-2,
@@ -159,7 +160,11 @@ def scale() -> None:
                     "role": "assistant",
                     "content": None,
                     "tool_calls": [
-                        {"id": cid, "type": "function", "function": {"name": "b", "arguments": "{}"}}
+                        {
+                            "id": cid,
+                            "type": "function",
+                            "function": {"name": "b", "arguments": "{}"},
+                        }
                     ],
                 }
             )
@@ -175,8 +180,29 @@ def scale() -> None:
         print(f"| {n} | {len(m)} | {time.perf_counter() - t:.2f} |")
 
 
+def big() -> None:
+    """One huge tool output through fit() with the default estimator (CPU only)."""
+    import json
+
+    cases = {
+        "4.8 MB log, 400k repeated lines": "GET /health 200 12ms\n" * 230_000,
+        "3 MB on one line": "x" * 3_000_000,
+        "60k-row JSON array (2.6 MB)": json.dumps(
+            [{"id": i, "v": "a" * 20} for i in range(60_000)]
+        ),
+    }
+    print("| input | fit() seconds |\n|---|---:|")
+    for name, text in cases.items():
+        m = nc.as_messages(text)
+        t = time.perf_counter()
+        ctxfit.fit(m, total_budget=2_000)
+        print(f"| {name} | {time.perf_counter() - t:.2f} |")
+
+
 if __name__ == "__main__":
-    if "--scale" in sys.argv:
+    if "--big" in sys.argv:
+        big()
+    elif "--scale" in sys.argv:
         scale()
     else:
         needles(5)

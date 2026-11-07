@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from .adapters import to_anthropic, to_lc_messages, to_openai
 from .budgets import Budget, BudgetLedger, BudgetOverflow, OverflowWarning
 from .estimate import TokenEstimator, count_by_section, get_estimator, top_consumers
-from .messages import KIND_TOOL_RESULT, Message, normalize, validate_pairing
+from .messages import (
+    KIND_TOOL_RESULT,
+    Message,
+    count_opaque,
+    normalize,
+    printable,
+    raw_passthrough,
+    validate_pairing,
+    with_extras,
+)
 from .strategies import (
     AGGRESSIVE_STRATEGIES,
     DEFAULT_STRATEGIES,
@@ -37,6 +45,10 @@ class FitReport:
     facts_seen: int | None = None
     facts_lost: list[str] = field(default_factory=list)
     facts_lost_count: int = 0
+    # Source messages passed through unchanged because they hold images,
+    # thinking blocks, cache_control marks or other parts the text model
+    # cannot represent. Their non-text parts are not counted in the estimates.
+    passthrough_messages: int = 0
 
     @property
     def total_before(self) -> int:
@@ -63,7 +75,8 @@ class FitReport:
     def summary(self) -> str:
         lines = [
             f"est. tokens: {self.total_before:,} → {self.total_after:,} "
-            f"(−{self.savings_pct:.1f}%) [{self.estimator_name}]",
+            f"({'−' if self.savings_pct >= 0 else '+'}{abs(self.savings_pct):.1f}%) "
+            f"[{self.estimator_name}]",
         ]
         for section in ("system", "retrieved", "history", "scratchpad"):
             b, a = self.tokens_before.get(section, 0), self.tokens_after.get(section, 0)
@@ -86,6 +99,12 @@ class FitReport:
                 )
         else:
             lines.append("within budget ✓")
+        if self.passthrough_messages:
+            lines.append(
+                f"note: {self.passthrough_messages} message(s) hold images, thinking blocks or "
+                "other non-text parts; kept unchanged and pinned, and those parts are not "
+                "counted in the estimates"
+            )
         if self.facts_seen is not None:
             if self.facts_lost_count:
                 sample = "; ".join(_safe(t) for t in self.facts_lost[:5])
@@ -113,6 +132,7 @@ class FitReport:
             "facts_seen": self.facts_seen,
             "facts_lost_count": self.facts_lost_count,
             "facts_lost": self.facts_lost,
+            "passthrough_messages": self.passthrough_messages,
             "warnings": [str(w) for w in self.warnings],
             "strategies": [
                 {
@@ -127,14 +147,11 @@ class FitReport:
 
 
 _AUDIT_MAX_CHARS = 4_000_000
-_UNSAFE_RE = re.compile(
-    "[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
-)
 
 
 def _safe(token: str) -> str:
     """Make untrusted text printable: control, bidi and zero-width chars -> \\uXXXX."""
-    return _UNSAFE_RE.sub(lambda m: f"\\u{ord(m.group()):04x}", token)[:120]
+    return printable(token, 120)
 
 
 def _audit_facts(
@@ -172,8 +189,10 @@ class FitPipeline:
         strict: bool = False,
         aggressive: bool = False,
         audit_facts: bool = False,
+        offload: MutableMapping[str, str] | None = None,
     ) -> None:
         self.audit_facts = audit_facts
+        self.offload = offload
         if strategies is None:
             kinds = AGGRESSIVE_STRATEGIES if aggressive else DEFAULT_STRATEGIES
             strategies = [k() for k in kinds]
@@ -191,6 +210,14 @@ class FitPipeline:
 
     def fit_messages(self, messages: Sequence[Message]) -> tuple[list[Message], FitReport]:
         """Fit an already-normalized message list. Returns (fitted, report)."""
+        try:
+            return self._fit_messages(messages)
+        finally:  # do not keep big tool outputs alive inside a long-lived pipeline object
+            clear = getattr(self.estimator, "clear_cache", None)
+            if callable(clear):
+                clear()
+
+    def _fit_messages(self, messages: Sequence[Message]) -> tuple[list[Message], FitReport]:
         current = list(messages)
         input_problems = validate_pairing(current)
         if input_problems:
@@ -207,6 +234,7 @@ class FitPipeline:
                 budget=self.budget,
                 ledger=self._ledger(current),
                 aggressive=self.aggressive,
+                offload=self.offload,
             )
             current, sreport = strategy(current, ctx)
             strategy_reports.append(sreport)
@@ -232,6 +260,7 @@ class FitPipeline:
             facts_seen=facts_seen,
             facts_lost=lost[:20],
             facts_lost_count=len(lost),
+            passthrough_messages=count_opaque(current),
             tokens_before=before,
             tokens_after=after,
             strategy_reports=strategy_reports,
@@ -263,7 +292,7 @@ class FitPipeline:
             return to_anthropic(fitted), report
         if detected == "langchain":
             return to_lc_messages(fitted), report
-        return [m.to_dict() for m in fitted], report
+        return [raw_passthrough([m]) or with_extras(m.to_dict(), [m]) for m in fitted], report
 
     def analyze(self, raw: Sequence[Any], flavor: str = "auto", top_n: int = 10) -> dict[str, Any]:
         """Measure without modifying: section breakdown + top consumers."""
@@ -293,11 +322,16 @@ def fit(
     aggressive: bool = False,
     flavor: str = "auto",
     audit_facts: bool = False,
+    offload: MutableMapping[str, str] | None = None,
 ) -> tuple[list[Any], FitReport]:
     """One-call API: fit raw messages within budget.
 
     strategies: "default" | "aggressive" | a list of Strategy instances.
     Returns ``(fitted_messages_in_original_shape, FitReport)``.
+
+    offload: pass a dict to keep the full text of every truncated tool output
+    (``{id: text}``, id = :func:`ctxfit.output_id`); the cut marker names the id so your
+    loop can serve the original back when the model asks for it.
 
     Note: token figures are estimates (heuristic ±~25%). Budget 80-90% of
     your model's true context window as a safety margin.
@@ -319,5 +353,6 @@ def fit(
         strict=strict,
         aggressive=aggressive,
         audit_facts=audit_facts,
+        offload=offload,
     )
     return pipeline.fit(raw, flavor=flavor)

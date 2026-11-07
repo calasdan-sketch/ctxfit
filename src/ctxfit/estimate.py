@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 from collections.abc import Sequence
 from typing import Protocol
 
-from .messages import Message
+from .messages import Message, printable
 
 # Per-message overhead approximating <|role|> framing tokens.
 PER_MESSAGE_OVERHEAD = 4
@@ -43,6 +44,27 @@ _CJK_RE = re.compile(
 )
 
 
+_BIG = 20_000  # texts at least this long are memoised (a fit() counts the same text many times)
+_BIG_KEEP = 6
+
+
+_memo_lock = threading.Lock()
+
+
+def _memo(cache: dict, text: str, compute) -> int:
+    """Count a long text once; repeat calls with the same text are dictionary lookups."""
+    if len(text) < _BIG:
+        return compute(text)
+    hit = cache.get(text)
+    if hit is None:
+        hit = compute(text)
+        with _memo_lock:  # a pipeline object may be shared between threads
+            while len(cache) >= _BIG_KEEP:
+                cache.pop(next(iter(cache)), None)
+            cache[text] = hit
+    return hit
+
+
 class TokenEstimator(Protocol):
     """Pluggable estimator: implement ``count(text)`` for your tokenizer."""
 
@@ -56,9 +78,18 @@ class HeuristicEstimator:
 
     name = "heuristic"
 
+    def __init__(self) -> None:
+        self._memo: dict[str, int] = {}
+
     def count(self, text: str) -> int:
         if not text:
             return 0
+        return _memo(self._memo, text, self._count)
+
+    def clear_cache(self) -> None:
+        self._memo.clear()
+
+    def _count(self, text: str) -> int:
         if text.isascii():  # fast path: no CJK possible (same result, ~50x faster)
             return max(1, math.ceil(len(text) / 4.0))
         cjk = len(_CJK_RE.findall(text))
@@ -73,6 +104,7 @@ class HeuristicEstimator:
 _WORD_RE = re.compile(r"[A-Za-z]+")
 _LONG_WORD_RE = re.compile(r"[A-Za-z]{8,}")
 _DIGITS_RE = re.compile(r"\d+")
+_ASCII_NONPUNCT_RE = re.compile(r"[ \t\n\r\f\v\x1c-\x1f0-9A-Za-z]+")
 _EMOJI_RE = re.compile("[\U0001f000-\U0001faff\u2600-\u27bf]")
 
 
@@ -89,9 +121,18 @@ class PieceEstimator:
 
     name = "pieces"
 
+    def __init__(self) -> None:
+        self._memo: dict[str, int] = {}
+
     def count(self, text: str) -> int:
         if not text:
             return 0
+        return _memo(self._memo, text, self._count)
+
+    def clear_cache(self) -> None:
+        self._memo.clear()
+
+    def _count(self, text: str) -> int:
         cjk = len(_CJK_RE.findall(text)) if not text.isascii() else 0
         emoji = len(_EMOJI_RE.findall(text)) if not text.isascii() else 0
         if cjk:
@@ -103,7 +144,10 @@ class PieceEstimator:
             total += math.ceil(len(w) / 7) - 1
         for d in _DIGITS_RE.findall(text):
             total += math.ceil(len(d) / 2)
-        punct = sum(1 for ch in text if not (ch.isspace() or ch.isalnum() and ch.isascii()))
+        if text.isascii():  # same number as the per-character loop below, in C
+            punct = len(_ASCII_NONPUNCT_RE.sub("", text))
+        else:
+            punct = sum(1 for ch in text if not (ch.isspace() or ch.isalnum() and ch.isascii()))
         total += 0.7 * (punct - emoji) + 2.0 * emoji
         total += 0.6 * text.count("\n") + cjk * 1.5
         return max(1, math.ceil(total))
@@ -177,12 +221,13 @@ def top_consumers(
     scored = [
         {
             "index": i,
-            "role": m.role,
-            "kind": m.kind,
+            "role": printable(m.role, 40),
+            "kind": printable(m.kind, 40),
             "section": m.section,
             "est_tokens": estimator.count_message(m),
             "chars": len(m.content),
-            "preview": (m.content[:80].replace("\n", " ") + ("…" if len(m.content) > 80 else "")),
+            "preview": printable(m.content[:80].replace("\n", " ").replace("\t", " "), 400)
+            + ("…" if len(m.content) > 80 else ""),
         }
         for i, m in enumerate(messages)
     ]

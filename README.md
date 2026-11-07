@@ -53,7 +53,7 @@ tokenizer. Measured against cl100k_base (`benchmarks/estimator_bench.py`):
 
 | content | chars/4 | pieces |
 |---|---:|---:|
-| real Python source | 1.10 | 1.03 |
+| real Python source (varies with the files on the machine) | 1.10 | 1.03 |
 | real prose | 0.97 | 1.11 |
 | logs (synthetic) | 0.62 | 0.89 |
 | JSON rows (synthetic) | 0.60 | 0.97 |
@@ -79,7 +79,7 @@ cl100k_base), CPU only, no paid API; competitors run only if installed:
 | compressor | needles kept | tokens saved | ms/case |
 |---|---:|---:|---:|
 | ctxfit 0.7 behaviour (head+tail, 50 rows) | 0 / 20 | 92.0% | 4 |
-| **ctxfit unreleased 0.8** (salient lines, outlier rows) | **20 / 20** | 91.4% | 7 |
+| **ctxfit unreleased 0.8** (salient lines, outlier rows) | **20 / 20** | 91.4% | 6 |
 | [Headroom](https://github.com/chopratejas/headroom) 0.43.1 `compress()` | 20 / 20 | 63.2% | 54 |
 | [LangChain `trim_messages`](https://python.langchain.com/docs/how_to/trim_messages/) (langchain-core 1.7.6, last, 6k) | 10 / 20 | 76.4% | 30 |
 | [LLMLingua-2](https://github.com/microsoft/LLMLingua) 0.2.2, rate 0.2, CPU | 5 / 20 | 69.9% | 17,843 |
@@ -96,6 +96,14 @@ after compression (see JetBrains Research on masking, cited below),
 non-English text, real transcripts (`ctxfit replay` does that on yours).
 Want to know what a run lost? `ctxfit.fit(..., audit_facts=True)` or
 `--audit-facts` lists the paths, codes, versions and ids that no longer appear.
+Competitor versions were re-checked on PyPI on 2026-11-07 (still the ones above); their
+rows were not re-run. Headroom's README also lists reversible retrieval (`headroom_retrieve`)
+and ML image compression, which `fit()` only partly matches (see `offload=` below; images are
+left untouched, not shrunk).
+
+Speed on one huge output (`benchmarks/needle_bench.py --big`, default estimator, one shared
+cloud CPU, indicative): a 4.8 MB log of 400k repeated lines 6.1 s -> 1.0 s, 3 MB on one line
+1.7 s -> 0.14 s, a 60,000-row JSON array 2.6 s -> 0.4 s.
 
 ## Install
 
@@ -123,7 +131,11 @@ ctxfit estimate "some text"
 ```
 
 `convo.json` is a JSON array of message dicts (generic `{"role","content"}` or
-OpenAI-shaped; `--flavor` overrides auto-detection).
+OpenAI-shaped; `--flavor` overrides auto-detection, and an unknown flavor is an error).
+Files saved by Windows tools (UTF-8 with BOM, UTF-16 from PowerShell `>`) are read as is.
+`-` means standard input (`ctxfit analyze -`) or, for `--out`, standard output
+(`ctxfit fit c.json --out -`, the summary then goes to stderr). Output files are written
+whole or not at all, so `--out` may name the input file. `--strict` overflow exits 2.
 
 ## Python API
 
@@ -194,6 +206,31 @@ System messages are pinned automatically. Pin anything that must survive:
 
 Pinned messages are never dropped; truncated only with explicit opt-in
 (`TruncateToolOutput(truncate_pinned=True)`).
+
+### Images, thinking blocks and provider fields
+
+`fit()` works on text. A message that carries something it cannot represent, such as an
+image part, a document, an Anthropic `thinking` block with its signature, `cache_control`, or a
+provider field on a block or tool call, is **handed back exactly as it came in**: no strategy
+rewrites it, and it is never half-rebuilt. It is not pinned, so the sliding window and
+aggressive mode may still drop it whole (with its turn). Fields on the message itself that ctxfit
+does not model (`refusal`, `reasoning_content`, `name`, your own ids) are copied back onto the
+rebuilt message. `report.passthrough_messages` and `summary()` say how many messages were
+handled this way; **their non-text parts are not counted in the token estimates** (image token
+cost depends on the provider and is not guessed). Older versions silently deleted these parts.
+
+### Getting the original back (`offload=`)
+
+```python
+store = {}                                     # any dict-like; you decide how long it lives
+fitted, report = ctxfit.fit(messages, total_budget=60_000, offload=store)
+# a cut tool output now ends its marker with "full text id 3f9a1c07"; store["3f9a1c07"] is the original
+```
+
+Ids are the first 8 hex of the output's sha256 (`ctxfit.output_id(text)`), the same ids running
+notes use. ctxfit only fills the dict; serving it to the model (a tool, a retry) is your loop's
+job. Off by default, nothing changes when it is off. Only `TruncateToolOutput` offloads; rows
+dropped by `CompactJson` and turns dropped by the window are not stored.
 
 ## Running notes (opt-in, 0.7.0)
 
@@ -535,13 +572,20 @@ runs too.
   (or sits in output with no repeated structure) is still lost. Pin or
   pre-filter such payloads, and use `audit_facts=True` to see what went.
 - **JSON compaction is whole-message only** (no substring extraction);
-  non-uniform object arrays are left alone; table cells truncate at 120 chars
+  non-uniform object arrays are left alone; objects with a repeated key are left alone
+  (a table would silently keep only one value); numbers keep their written spelling
+  (`10.50` stays `10.50`); table cells truncate at 120 chars
   (marked `…`); only applied when it actually saves tokens.
 - **Exact-match dedup only.** Near-duplicates are not merged — deliberate;
   fuzzy matching is unexplainable and risky.
 - **No LLM calls in `fit()`, ever.** The core pipeline is structural only.
   Summarisation exists only in the opt-in running notes, through a
   summariser you supply and pay for (see "Running notes").
+- **Non-text parts are not estimated.** Images, documents and thinking blocks pass through
+  unchanged and uncounted (see "Images, thinking blocks and provider fields"). A budget on an
+  image-heavy conversation is therefore too optimistic by the image cost; leave margin.
+- **Very large inputs are linear, not instant.** About 1 s per 5 MB of tool output on one core;
+  the running-notes layer is separate and unchanged.
 - **Turn counting is user-message-led.** Tool-heavy loops with few user turns
   should use `aggressive=True`.
 - **`to_anthropic` emits system messages as `{"role": "system"}` dicts** —
@@ -554,7 +598,7 @@ runs too.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest          # 437 tests
+.venv/bin/python -m pytest          # 469 tests
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
 ```

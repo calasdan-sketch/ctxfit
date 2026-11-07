@@ -161,9 +161,7 @@ def test_fixture_scenario_through_keeper(path):
 
     summ = Scripted()
     clock = [None]
-    k = NotesKeeper(
-        summ, summarizer_timeout_s=None, clock=lambda: clock[0], **data["config"]
-    )
+    k = NotesKeeper(summ, summarizer_timeout_s=None, clock=lambda: clock[0], **data["config"])
     for i, step in enumerate(data["steps"]):
         summ.spec = step.get("summariser")
         clock[0] = datetime.fromisoformat(step.get("now", DEFAULT_NOW).replace("Z", "+00:00"))
