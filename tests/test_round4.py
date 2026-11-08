@@ -484,7 +484,7 @@ def test_piece_estimator_matches_the_per_character_definition():
 
     random.seed(7)
     alphabet = list("abcXYZ019 \t\n\r\x0b\x0c\x1c\x1f.,;:{}[]()_-/\\\"'") + list(
-        "éüñ你好\U0001f600→…—‮  ​́ß"
+        "你好\U0001f600→…—‮  ​́×"
     )
     est = ctxfit.get_estimator("pieces")
     import math

@@ -1,0 +1,7 @@
+est. tokens: 4,389 → 4,389 (−0.0%) [pieces]
+  system             5 →         5
+  retrieved      4,369 →     4,369
+  history           15 →        15
+warnings:
+  ! section 'retrieved' over budget: 4,369 est. tokens used vs 825 allowed (over by 3,544)
+  hint: sections still overflow — retry with aggressive=True to enable last-resort dropping, or raise the budget

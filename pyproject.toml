@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Calas Automations Inc." }]
+maintainers = [{ name = "Calas Automations Inc." }]
 keywords = [
     "llm", "agents", "context-window", "token-optimization", "prompt-engineering",
     "context-compression", "tool-output", "openai", "anthropic", "langchain",
@@ -32,7 +33,7 @@ classifiers = [
 
 [project.optional-dependencies]
 tiktoken = ["tiktoken>=0.5"]
-dev = ["pytest>=8", "ruff>=0.4"]
+dev = ["pytest>=8", "ruff>=0.4", "hypothesis>=6"]
 
 [project.scripts]
 ctxfit = "ctxfit.cli:main"

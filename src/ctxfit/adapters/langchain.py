@@ -75,6 +75,29 @@ def _lc_content_text(content: Any) -> str:
     return str(content)
 
 
+def _tool_call_parts(tc: Any) -> tuple[str | None, str, Any]:
+    """(name, arguments as JSON text, id) of one tool call, OpenAI-shaped or LangChain-native.
+
+    LangChain's own ``AIMessage.tool_calls`` entries are ``{"name", "args" (a dict), "id",
+    "type": "tool_call"}``; ``additional_kwargs["tool_calls"]`` entries are OpenAI-shaped
+    (``{"function": {"name", "arguments"}}``). Both are read; neither loses its arguments.
+    """
+
+    def get(key: str) -> Any:
+        return tc.get(key) if isinstance(tc, dict) else getattr(tc, key, None)
+
+    fn = get("function")
+    if isinstance(fn, dict):
+        name, args = fn.get("name"), fn.get("arguments", "")
+    else:
+        name, args = get("name"), get("args")
+    if args is None:
+        args = ""
+    if not isinstance(args, str):
+        args = json.dumps(args, ensure_ascii=False)
+    return (name if isinstance(name, str) and name else None), args, get("id")
+
+
 def from_lc_messages(raw: Sequence[Any]) -> list[Message]:
     out: list[Message] = []
     for i, obj in enumerate(raw):
@@ -109,17 +132,14 @@ def from_lc_messages(raw: Sequence[Any]) -> list[Message]:
                     )
                 )
             for tc in tool_calls:
-                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                args = fn.get("arguments", "")
-                if not isinstance(args, str):
-                    args = json.dumps(args, ensure_ascii=False)
+                name_, args, cid = _tool_call_parts(tc)
                 out.append(
                     Message(
                         role="assistant",
                         content=args,
                         kind=KIND_TOOL_CALL,
-                        name=fn.get("name") or getattr(tc, "name", None),
-                        call_id=tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None),
+                        name=name_,
+                        call_id=cid,
                         section=section,
                         pinned=pinned,
                         meta={**meta, "part": "tool_call"},
@@ -153,6 +173,15 @@ def from_lc_messages(raw: Sequence[Any]) -> list[Message]:
     return out
 
 
+def _args_value(text: str) -> Any:
+    """LangChain wants ``args`` as a dict; keep the text when it is not a JSON object."""
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return text
+    return value if isinstance(value, dict) else text
+
+
 def to_lc_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
     """Plain dicts shaped like LangChain messages (no langchain import)."""
     out: list[dict[str, Any]] = []
@@ -165,7 +194,7 @@ def to_lc_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
                     "tool_calls": [
                         {
                             "name": m.name or "",
-                            "args": m.content,
+                            "args": _args_value(m.content),
                             "id": m.call_id,
                             "type": "tool_call",
                         }

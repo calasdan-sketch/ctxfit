@@ -1,0 +1,7 @@
+est. tokens: 4,396 → 864 (−80.3%) [pieces]
+  retrieved      4,369 →       837
+  history           27 →        27
+  truncate_tool_output: −3,532 est. tokens, 1 message(s)
+warnings:
+  ! section 'retrieved' over budget: 837 est. tokens used vs 825 allowed (over by 12)
+  hint: sections still overflow — retry with aggressive=True to enable last-resort dropping, or raise the budget

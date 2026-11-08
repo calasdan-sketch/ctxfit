@@ -11,7 +11,9 @@ other models differ.
 
 from __future__ import annotations
 
+import base64
 import glob
+import random
 import site
 import sys
 from pathlib import Path
@@ -47,6 +49,17 @@ sets = {
 }
 for kind in ("log", "json_rows", "source", "search_text"):
     sets[f"synthetic {kind}"] = [t for k, t, _ in nc.cases(per_kind=6) if k == kind]
+
+# Round 5: other scripts. Short held-out sentences (the rates were fitted on different text); the
+# same sentences are pinned, with their real token counts, in benchmarks/held_out_text.py.
+from held_out_text import HELD_OUT  # noqa: E402
+
+by_script = {name: text for name, text, _ in HELD_OUT}
+sets.update({f"{name} sentence": [text] for name, text in by_script.items()})
+rng = random.Random(3)
+sets["base64 blob (random bytes)"] = [
+    base64.b64encode(rng.randbytes(n)).decode() for n in (600, 3000, 30000)
+]
 
 pieces, legacy = PieceEstimator(), HeuristicEstimator()
 print("| content | samples | chars/4 (legacy) | pieces (default) |\n|---|---:|---:|---:|")

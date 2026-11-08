@@ -144,6 +144,50 @@ def _note(msg: str, out: str | None, quiet: bool = False) -> None:
     _say(msg, sys.stderr if (out == "-" or quiet) else sys.stdout)
 
 
+def _load_jsonl(text: str, path: str, shown: str) -> list[Any] | None:
+    """Messages from a JSON-lines file, or None when the text is not JSON lines.
+
+    Two shapes: one message per line (``{"role": ..., "content": ...}``), or a Claude Code
+    transcript (``~/.claude/projects/**/*.jsonl``), from which the longest request is rebuilt.
+    """
+    # Split on "\n" only: str.splitlines() also cuts at U+2028 / U+0085 / form feed, which JSON
+    # allows unescaped inside a string (Node writes U+2028 as is).
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    if len(lines) < 2:
+        return None
+    rows: list[Any] = []
+    try:
+        for ln in lines:
+            rows.append(json.loads(ln))
+    except (ValueError, RecursionError):
+        return None
+    if not all(isinstance(r, dict) for r in rows):
+        return None
+    if any("role" in r for r in rows):
+        return rows
+    if not any(isinstance(r.get("uuid"), str) and "message" in r for r in rows):
+        return None
+    if path == "-":
+        raise CliError(
+            "a Claude Code transcript has to be read from a file, not standard input; give its path"
+        )
+    if any(ch in path for ch in "*?"):
+        raise CliError(f"{shown}: give the transcript's own path (no * or ? patterns here)")
+    from .replay import load_corpus
+
+    requests = load_corpus([path]).requests
+    if not requests:
+        raise CliError(f"{shown} is a Claude Code transcript but holds no model request yet")
+    best = max(requests, key=lambda r: (len(r.messages), r.ts_ms))
+    _say(
+        f"ctxfit: read a Claude Code transcript: using its longest request ({len(best.messages)} "
+        f"messages, of {len(requests)} requests). The system prompt and tool definitions are not "
+        "in the file, so they are not counted.",
+        sys.stderr,
+    )
+    return best.messages
+
+
 def _load(path: str) -> list[Any]:
     text = _read(path)
     shown = "standard input" if path == "-" else repr(printable(path, 200))
@@ -152,9 +196,12 @@ def _load(path: str) -> list[Any]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise CliError(
-            f"{shown} is not valid JSON ({exc.msg}, line {exc.lineno}, column {exc.colno})"
-        ) from None
+        rows = _load_jsonl(text, path, shown)
+        if rows is None:
+            raise CliError(
+                f"{shown} is not valid JSON ({exc.msg}, line {exc.lineno}, column {exc.colno})"
+            ) from None
+        data = rows
     except RecursionError:
         raise CliError(f"{shown} is nested too deeply to read") from None
     if isinstance(data, dict) and "messages" in data:
@@ -180,6 +227,21 @@ def _parse_budgets(spec: str | None) -> dict[str, float] | None:
     return out
 
 
+def _parse_tool_limits(specs: list[str] | None) -> dict[str, int] | None:
+    if not specs:
+        return None
+    out: dict[str, int] = {}
+    for spec in specs:
+        name, _, num = spec.rpartition("=")
+        if not name or not num.strip().isdigit():
+            raise CliError(
+                f"bad --tool-limit {printable(spec, 80)!r}: write NAME=CHARACTERS, e.g. "
+                "read_file=0 (never shorten) or bash=8000"
+            )
+        out[name] = int(num)
+    return out
+
+
 def _build_pipeline(args: argparse.Namespace) -> FitPipeline:
     return FitPipeline(
         estimator=args.estimator,
@@ -188,6 +250,7 @@ def _build_pipeline(args: argparse.Namespace) -> FitPipeline:
         aggressive=args.aggressive,
         audit_facts=getattr(args, "audit_facts", False),
         pairing="repair" if getattr(args, "repair_pairing", False) else "strict",
+        tool_limits=_parse_tool_limits(getattr(args, "tool_limit", None)),
     )
 
 
@@ -427,6 +490,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ctxfit",
         description="Drop-in context-window optimizer: fit any message list within budget.",
+        epilog="ctxfit is MIT licensed software by Calas Automations Inc.",
     )
     p.add_argument(
         "--budget",
@@ -464,14 +528,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
 
     a = sub.add_parser("analyze", help="token breakdown by section; no changes made")
-    a.add_argument("input", help="JSON file: array of messages")
+    a.add_argument(
+        "input", help="JSON file: array of messages (or JSON lines / a Claude Code transcript)"
+    )
     a.add_argument("--format", choices=("table", "json"), default="table")
     a.add_argument("--top", type=int, default=10, help="top-N consumers to list")
     a.add_argument("--json", action="store_true", help="same as --format json")
     a.set_defaults(func=cmd_analyze)
 
     f = sub.add_parser("fit", help="compress the conversation to fit the budget")
-    f.add_argument("input", help="JSON file: array of messages")
+    f.add_argument(
+        "input", help="JSON file: array of messages (or JSON lines / a Claude Code transcript)"
+    )
     f.add_argument("--out", default=None, help="write fitted messages here (JSON)")
     f.add_argument("--report", default=None, help="write FitReport JSON here")
     f.add_argument("--json", action="store_true", help="print the report as JSON on stdout")
@@ -479,6 +547,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--repair-pairing",
         action="store_true",
         help="drop tool calls without results and results without calls instead of failing",
+    )
+    f.add_argument(
+        "--tool-limit",
+        action="append",
+        metavar="NAME=N",
+        help="per-tool limit in characters, repeatable; 0 = never shorten that tool's output "
+        "(e.g. --tool-limit read_file=0 --tool-limit bash=8000)",
     )
     f.set_defaults(func=cmd_fit)
 

@@ -42,6 +42,8 @@ from .strategies import (
 )
 
 __version__ = "0.8.0"
+__author__ = "Calas Automations Inc."
+__license__ = "MIT"
 
 __all__ = [
     "Budget",
@@ -72,6 +74,8 @@ __all__ = [
     "TokenEstimator",
     "TruncateToolOutput",
     "output_id",
+    "__author__",
+    "__license__",
     "__version__",
     "anthropic_summarizer",
     "finish_context",

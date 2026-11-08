@@ -84,9 +84,13 @@ class Message:
             d["name"] = self.name
         if self.call_id:
             d["call_id"] = self.call_id
-        if self.section != "history":
+        # Only what the caller could not get back by re-reading the dict: the section when it is
+        # not the one the role/kind implies, and ``pinned`` when the role does not pin by itself.
+        # (A system message used to come back with ``section``/``pinned`` keys it never had,
+        # which a provider API may reject as unknown fields.)
+        if self.section != assign_section(self.role, self.kind):
             d["section"] = self.section
-        if self.pinned:
+        if self.pinned and self.role != "system":
             d["pinned"] = True
         return d
 

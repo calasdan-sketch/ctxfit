@@ -1,0 +1,56 @@
+{
+  "estimator": "pieces",
+  "total_budget": 1500,
+  "tokens_before": {
+    "system": 5,
+    "retrieved": 4369,
+    "history": 15,
+    "scratchpad": 0
+  },
+  "tokens_after": {
+    "system": 5,
+    "retrieved": 4369,
+    "history": 15,
+    "scratchpad": 0
+  },
+  "total_before": 4389,
+  "total_after": 4389,
+  "saved_est": 0,
+  "savings_pct": 0.0,
+  "over_budget": true,
+  "facts_seen": null,
+  "facts_lost_count": 0,
+  "facts_lost": [],
+  "passthrough_messages": 0,
+  "pairing_repaired": 0,
+  "pairing_repairs": [],
+  "warnings": [
+    "section 'retrieved' over budget: 4,369 est. tokens used vs 825 allowed (over by 3,544)"
+  ],
+  "strategies": [
+    {
+      "strategy": "deduplicate",
+      "saved_tokens_est": 0,
+      "messages_affected": 0,
+      "actions": []
+    },
+    {
+      "strategy": "compact_json",
+      "saved_tokens_est": 0,
+      "messages_affected": 0,
+      "actions": []
+    },
+    {
+      "strategy": "truncate_tool_output",
+      "saved_tokens_est": 0,
+      "messages_affected": 0,
+      "actions": []
+    },
+    {
+      "strategy": "sliding_window",
+      "saved_tokens_est": 0,
+      "messages_affected": 0,
+      "actions": []
+    }
+  ]
+}

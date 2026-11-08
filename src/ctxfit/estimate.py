@@ -101,11 +101,44 @@ class HeuristicEstimator:
         return self.count(msg.content) + PER_MESSAGE_OVERHEAD
 
 
-_WORD_RE = re.compile(r"[A-Za-z]+")
-_LONG_WORD_RE = re.compile(r"[A-Za-z]{8,}")
+# Accented letters stay inside their word but each one makes the tokenizer cut the word (about
+# 1.6 extra tokens per accented letter on cl100k_base over French/German/Spanish/Polish/Czech).
+_ACCENT_RE = re.compile("[\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff]")
+# Letters with accents (French, German, Spanish, Polish ...) belong to the word they sit in.
+_WORD_RE = re.compile("[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff]+")
+_LONG_WORD_RE = re.compile("[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff]{8,}")
+# Scripts whose tokens-per-character is far from the Latin rule (measured on cl100k_base over
+# held-in samples, checked on held-out text by benchmarks/estimator_bench.py): Cyrillic is cheaper
+# than the generic 0.7 per symbol, Greek, Hebrew, Arabic, the Indic scripts and Thai cost more.
+_SCRIPT_RATES: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile("[\u0400-\u052f]"), 0.55),  # Cyrillic
+    (re.compile("[\u0370-\u03ff\u1f00-\u1fff]"), 1.1),  # Greek
+    (re.compile("[\u0590-\u05ff]"), 1.15),  # Hebrew
+    (re.compile("[\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]"), 0.9),  # Arabic
+    (re.compile("[\u0900-\u0dff]"), 1.3),  # Devanagari, Bengali ... Sinhala
+    (re.compile("[\u0e00-\u0eff]"), 1.0),  # Thai, Lao
+)
+# A long run of mixed-case letters, digits and + / (a base64 blob, e.g. an inlined screenshot):
+# about 0.72 tokens per character on cl100k_base. Requires upper, lower and a digit so ordinary
+# words, hex hashes and paths (too many slashes) do not match.
+_B64_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}")
 _DIGITS_RE = re.compile(r"\d+")
 _ASCII_NONPUNCT_RE = re.compile(r"[ \t\n\r\f\v\x1c-\x1f0-9A-Za-z]+")
-_NONPUNCT_RE = re.compile(r"[\s0-9A-Za-z]+")
+_NONPUNCT_RE = re.compile("[\\s0-9A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u1e00-\u1eff]+")
+
+
+_HAS_DIGIT, _HAS_UPPER, _HAS_LOWER = (re.compile(p) for p in ("[0-9]", "[A-Z]", "[a-z]"))
+
+
+def _is_b64(run: str) -> bool:
+    return bool(
+        run.count("/") * 12 <= len(run)  # a path has far more slashes than base64 (about 1 in 64)
+        and _HAS_DIGIT.search(run)
+        and _HAS_UPPER.search(run)
+        and _HAS_LOWER.search(run)
+    )
+
+
 _EMOJI_RE = re.compile("[\U0001f000-\U0001faff\u2600-\u27bf]")
 
 
@@ -139,6 +172,24 @@ class PieceEstimator:
         if cjk:
             text = _CJK_RE.sub("", text)
         total = 0.0
+        if not text.isascii():
+            total += 1.6 * len(_ACCENT_RE.findall(text))
+            for pat, rate in _SCRIPT_RATES:
+                text, n = pat.subn("", text)
+                total += n * rate
+        if len(text) >= 40:
+            blob_chars = 0
+
+            def _blob(m: re.Match[str]) -> str:
+                nonlocal blob_chars
+                run = m.group()
+                if not _is_b64(run):
+                    return run
+                blob_chars += len(run)
+                return " "
+
+            text = _B64_RE.sub(_blob, text)  # one pass: replacing match by match was quadratic
+            total += 0.72 * blob_chars
         words = _WORD_RE.findall(text)
         total += len(words)
         for w in _LONG_WORD_RE.findall(text):

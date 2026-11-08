@@ -6,6 +6,7 @@ tokens saved (tiktoken cl100k_base when installed), whether the needle string
 is still in the result, and time per case. No network, no paid API.
 
     python benchmarks/needle_bench.py            # ctxfit variants (+ any competitor installed)
+    python benchmarks/needle_bench.py --flood    # adds the "real fatal among 15 WARN lines" case (round 5)
     python benchmarks/needle_bench.py --scale    # fit() time vs conversation length
     python benchmarks/needle_bench.py --big      # fit() time on one huge tool output (default estimator)
 
@@ -126,8 +127,8 @@ def _available():
         yield name, fn
 
 
-def needles(per_kind: int) -> None:
-    cases = nc.cases(per_kind=per_kind)
+def needles(per_kind: int, flood: bool = False) -> None:
+    cases = nc.cases(per_kind=per_kind, flood=flood)
     kinds = list(dict.fromkeys(k for k, _, _ in cases))
     print(f"token counter: {COUNTER}; {len(cases)} cases ({per_kind} per kind), seed fixed\n")
     print("| compressor | " + " | ".join(kinds) + " | needles kept | tokens saved | ms/case |")
@@ -205,4 +206,4 @@ if __name__ == "__main__":
     elif "--scale" in sys.argv:
         scale()
     else:
-        needles(5)
+        needles(5, flood="--flood" in sys.argv)

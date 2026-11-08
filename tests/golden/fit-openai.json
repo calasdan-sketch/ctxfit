@@ -1,0 +1,52 @@
+[
+  {
+    "role": "system",
+    "content": "Be brief."
+  },
+  {
+    "role": "user",
+    "content": "go"
+  },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "c0",
+        "type": "function",
+        "function": {
+          "name": "run",
+          "arguments": "{}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "line 0 ok\nline 1 ok\nline 2 ok\nline 3 ok\nline 4 ok\nline 5 ok\nline 6 ok\nline 7 ok\nline 8 ok\nline 9 ok\nline 10 ok\nline 11 ok\nline 12 ok\nline 13 ok\nline 14 ok\nline 15 ok\nline 16 ok\nline 17 ok\nline 18 ok\nline 19 ok\nline 20 ok\nline 21 ok\nline 22 ok\nline 23 ok\nline 24 ok\nline 25 ok\nline 26 ok\nline 27 ok\nline 28 ok\nline 29 ok\nline 30 ok\nline 31 ok\nline 32 ok\nline 33 ok\nline 34 ok\nline 35 ok\nline 36 ok\nline 37 ok\nline 38 ok\nline 39 ok\nline 40 ok\nline 41 ok\nline 42 ok\nline 43 ok\nline 44 ok\nline 45 ok\nline 46 ok\nline 47 ok\nline 48 ok\nline 49 ok\nline 50 ok\nline 51 ok\nline 52 ok\nline 53 ok\nline 54 ok\nline 55 ok\nline 56 ok\nline 57 ok\nline 58 ok\nline 59 ok\nline 60 ok\nline 61 ok\nline 62 ok\nline 63 ok\nline 64 ok\nline 65 ok\nline 66 ok\nline 67 ok\nline 68 ok\nline 69 ok\nline 70 ok\nline 71 ok\nline 72 ok\nline 73 ok\nline 74 ok\nline 75 ok\nline 76 ok\nline 77 ok\nline 78 ok\nline 79 ok\nline 80 ok\nline 81 ok\nline 82 ok\nline 83 ok\nline 84 ok\nline 85 ok\nline 86 ok\nline 87 ok\nline 88 ok\nline 89 ok\nline 90 ok\nline 91 ok\nline 92 ok\nline 93 ok\nline 94 ok\nline 95 ok\nline 96 ok\nline 97 ok\nline 98 ok\nline 99 ok\nline 100 ok\nline 101 ok\nline 102 ok\nline 103 ok\nline 104 ok\nline 105 ok\nline 106 ok\nline 107 ok\nline 108 ok\nli\n[ctxfit: truncated — kept 1,200 head + 1,200 tail chars, omitted 9,305 chars (~3,567 est. tokens)]\n4 ok\nline 885 ok\nline 886 ok\nline 887 ok\nline 888 ok\nline 889 ok\nline 890 ok\nline 891 ok\nline 892 ok\nline 893 ok\nline 894 ok\nline 895 ok\nline 896 ok\nline 897 ok\nline 898 ok\nline 899 ok\nERROR E42 boom\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\ntail\n",
+    "tool_call_id": "c0"
+  },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "c1",
+        "type": "function",
+        "function": {
+          "name": "run",
+          "arguments": "{}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "[ctxfit: duplicate of an earlier identical message — 11,705 chars omitted]",
+    "tool_call_id": "c1"
+  },
+  {
+    "role": "user",
+    "content": "and now?"
+  }
+]

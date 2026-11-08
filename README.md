@@ -63,7 +63,9 @@ Strategies compress toward the budgets; surviving overruns produce warnings
 (`strict=True` raises `BudgetOverflow` instead).
 
 **Token estimation:** a dependency-free estimator by default (`pieces`: counts
-words, digit runs and punctuation separately, CJK-adjusted); automatically
+words, digit runs and punctuation separately; CJK, Greek, Cyrillic, Hebrew, Arabic, Indic
+scripts and Thai at their own measured rates; accented Latin letters; base64 blobs by the
+character); automatically
 upgrades to tiktoken's `cl100k_base` when installed. `estimator="heuristic"`
 is the old chars/4. Pluggable — implement `count(text)` for your own
 tokenizer. Measured against cl100k_base (`benchmarks/estimator_bench.py`):
@@ -77,6 +79,16 @@ tokenizer. Measured against cl100k_base (`benchmarks/estimator_bench.py`):
 
 (estimate / real tokens; 1.00 is exact. chars/4 under-counts machine output by
 about 40%, so a "within budget" answer could be 1.6x over in real tokens.)
+
+Text that is not English was the weak spot until round 5. On eight held-out sentences (six
+scripts plus German and Spanish; the rates were fitted on other text) the old `pieces` was off by
+-32% on Greek, -40% Hebrew, -45% Hindi, -26% Thai, -17% Arabic and +29% on Russian (chars/4 was
+45-75% low on all of them); now it lands at 0.94-1.06 of cl100k_base on every one
+(`benchmarks/estimator_bench.py` prints the rows; the sentences and their real token counts are in
+`benchmarks/held_out_text.py`). Accented Latin text (Polish, Czech, Turkish, Vietnamese probes) went
+from up to 33% low to at most 18% low, and random base64 (an inlined screenshot) from about half
+the real count to within 2%. Worst cases still seen: Ukrainian and Tamil about 17% low. The price:
+counting is about 40% slower per MB (0.056 to 0.08 s/MB on one shared core).
 
 **Framework adapters:** raw message-list dicts are first-class
 (`ctxfit.fit` accepts them directly). OpenAI-shaped (also covers
@@ -113,11 +125,18 @@ after compression (see JetBrains Research on masking, cited below),
 non-English text, real transcripts (`ctxfit replay` does that on yours).
 Want to know what a run lost? `ctxfit.fit(..., audit_facts=True)` or
 `--audit-facts` lists the paths, codes, versions and ids that no longer appear.
-Competitor versions were re-checked on PyPI on 2026-11-07 (still the ones above); their
+Competitor versions were re-checked on PyPI on 2026-11-08 (still the ones above); their
 rows were not re-run. The table's token counts used tiktoken; a rerun in round 4 without
 tiktoken (ctxfit's own estimator) still kept 20 / 20 needles at 91.9% saved. Headroom's README also lists reversible retrieval (`headroom_retrieve`)
 and ML image compression, which `fit()` only partly matches (see `offload=` below; images are
 left untouched, not shrunk).
+
+Round 5 added a harder log case (`needle_bench.py --flood`, kept out of the table above so the
+rows stay comparable): the real `ERROR ... FATAL` line sits after 15 distinct `WARN ... transient
+error ... retrying` lines. The round-4 ranking took lines in file order among equals and lost it
+in 1 of 5 seeds (24 / 25 overall); lines that call themselves ERROR/FATAL now rank above lines
+that call themselves WARN/INFO/DEBUG, and the case is 5 / 5 (25 / 25). If the distractors are
+also ERROR-level, nothing structural can tell them apart; use `audit_facts=True`.
 
 Speed on one huge output (`benchmarks/needle_bench.py --big`, default estimator, one shared
 cloud CPU, indicative): earlier rounds cut a 4.8 MB log of 400k repeated lines from 6.1 s to
@@ -149,6 +168,13 @@ ctxfit analyze convo.json --format json --top 20
 # Compress to fit, write fitted messages + report
 ctxfit fit convo.json --out fitted.json --report report.json --aggressive
 
+# Read a Claude Code transcript or a JSON-lines file directly (the longest request is used)
+ctxfit analyze ~/.claude/projects/<project>/<session>.jsonl --budget 128000
+ctxfit fit session.jsonl --out fitted.json
+
+# Never shorten one tool's output (the file you are editing); give another a limit
+ctxfit fit convo.json --tool-limit read_file=0 --tool-limit bash=8000
+
 # Section overrides + strict mode
 ctxfit --budget 64000 --budgets retrieved=0.6,history=0.2 --strict fit convo.json
 
@@ -176,6 +202,13 @@ plain-ASCII JSON; a file that an editor or virus scanner is holding is retried b
 `mask --offload` asks for owner-only file mode (0600); Windows ignores that, so keep such reports in a private folder.
 This was checked by simulating those consoles on Linux, not on a Windows machine (see Limitations).
 
+**JSON lines and Claude Code transcripts.** A file with one message per line works as is. A
+Claude Code transcript (`~/.claude/projects/**/*.jsonl`) is recognised too: ctxfit rebuilds the
+requests from the `parentUuid` chains (the same reader as `ctxfit replay`), takes the longest one,
+and says so on stderr. The system prompt and tool definitions are not in those files, so they are
+not counted. Give the file's own path (a transcript cannot be read from standard input, and `*`
+patterns are for `replay`).
+
 `convo.json` is a JSON array of message dicts (generic `{"role","content"}` or
 OpenAI-shaped; `--flavor` overrides auto-detection, and an unknown flavor is an error).
 Files saved by Windows tools (UTF-8 with BOM, UTF-16 from PowerShell `>`) are read as is.
@@ -199,6 +232,7 @@ fitted, report = ctxfit.fit(
     strict=False,              # True -> raise instead of warn
     flavor="auto",             # "openai" | "anthropic" | "langchain" | "generic"
     pairing="strict",          # "repair" drops unmatched tool calls/results instead of raising
+    tool_limits={"read_file": 0, "bash": 8000},   # 0 = never shorten that tool's output
 )
 
 # Full control
@@ -216,6 +250,17 @@ info = pipeline.analyze(messages)   # section usage, warnings, top consumers
 
 `FitReport` carries `tokens_before/after` per section, per-strategy savings,
 `warnings`, `over_budget`, plus `summary()` and `to_dict()`.
+
+### Per-tool limits
+
+`tool_limits={"read_file": 0, "bash": 8000}` (CLI `--tool-limit NAME=N`, repeatable) changes the
+default strategies for named tools: `0` leaves that tool's output alone (no truncation, JSON
+compaction or de-duplication), a number of at least 300 replaces the 4,000-character cut point for
+it. The name is read from the tool call that the result answers, so it works for OpenAI,
+Anthropic and LangChain message shapes (each covered by a test). Old turns can still be dropped whole by the sliding window, and a
+protected output that does not fit shows up as a budget warning, not a silent cut. With your own
+strategy list, pass `TruncateToolOutput(tool_limits=...)`, `CompactJson(protect_tools=[...])` and
+`Deduplicate(protect_tools=[...])` yourself.
 
 ### Custom strategies
 
@@ -607,8 +652,9 @@ runs too.
 ## Limitations (read before trusting it blindly)
 
 - **Estimates, not tokens.** `pieces` landed within about -11% / +17% of
-  cl100k_base on every class we tested (table above); chars/4 was 40% low on
-  logs and JSON, and emoji-heavy text is still under-counted. **Budget 80–90%
+  cl100k_base on every English/code/log class we tested (table above) and within about 17% on
+  the other scripts we probed; chars/4 was 40% low on logs and JSON. Scripts not listed above
+  (Armenian, Georgian, Ethiopic ...) and emoji-heavy text are still under-counted. **Budget 80–90%
   of your model's true window** as a safety margin. tiktoken (optional)
   narrows the error but no estimate equals your model's actual tokenizer.
 - **Lossy by design.** ctxfit deletes and rewrites content to fit budgets.
@@ -650,9 +696,10 @@ runs too.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest          # about 530 tests (the ones that need the shared ../fixtures folder skip without it)
-.venv/bin/ruff check src tests
-.venv/bin/ruff format --check src tests
+.venv/bin/python -m pytest          # about 590 tests (property tests need hypothesis: it is in the dev extra) (the ones that need the shared ../fixtures folder skip without it)
+.venv/bin/ruff check src tests benchmarks scripts
+.venv/bin/ruff format --check src tests benchmarks scripts
+.venv/bin/python scripts/mutation_check.py   # breaks one condition at a time; the tests must notice (minutes)
 ```
 
 ## License

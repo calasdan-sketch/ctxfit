@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +38,32 @@ _SEVERITY_RE = re.compile(
     r"refused|timed out|timeout|segfault|aborted|cannot|unable|invalid|unhandled)\b",
     re.IGNORECASE,
 )
+# How bad a line says it is. A line that names itself WARN/INFO/DEBUG is a lesser find than one
+# that names itself ERROR/FATAL, whatever words it contains ("WARN transient error, retrying"),
+# so when more lines qualify than fit, the bad ones are kept first.
+_STRONG_RE = re.compile(
+    r"\b(fatal|panic|critical|traceback|segfault|unhandled|aborted|exception)\b", re.IGNORECASE
+)
+_LEVEL_HIGH_RE = re.compile(r"(?<![A-Za-z])(ERROR|FATAL|CRITICAL|PANIC|SEVERE|EMERG)(?![A-Za-z])")
+_LEVEL_LOW_RE = re.compile(
+    r"(?<![A-Za-z])(WARN|WARNING|INFO|DEBUG|TRACE|NOTICE|VERBOSE)(?![A-Za-z])"
+)
+
+
+def _severity_score(line: str) -> int:
+    """0 = no severity word; higher = worse. Only used to rank lines that already qualify."""
+    if not _SEVERITY_RE.search(line):
+        return 0
+    score = 2
+    if _STRONG_RE.search(line):
+        score += 2
+    if _LEVEL_HIGH_RE.search(line):
+        score += 2
+    elif _LEVEL_LOW_RE.search(line):
+        score -= 1
+    return score
+
+
 MARKER_PREFIX = "[ctxfit"
 
 
@@ -120,6 +146,19 @@ class Strategy:
         raise NotImplementedError
 
 
+def _tool_names(messages: Sequence[Message]) -> dict[str, str]:
+    """call_id -> tool name, read from the tool_call messages (a tool result often has no name)."""
+    return {
+        m.call_id: m.name for m in messages if m.kind == KIND_TOOL_CALL and m.call_id and m.name
+    }
+
+
+def _tool_of(m: Message, names: dict[str, str]) -> str | None:
+    if m.kind != KIND_TOOL_RESULT:
+        return None
+    return m.name or (names.get(m.call_id) if m.call_id else None)
+
+
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
@@ -169,14 +208,19 @@ class Deduplicate(Strategy):
     name = "deduplicate"
     target_sections = ("retrieved", "history")
 
-    def __init__(self, min_chars: int = 120, **kw: Any) -> None:
+    def __init__(self, min_chars: int = 120, protect_tools: Sequence[str] = (), **kw: Any) -> None:
         super().__init__(**kw)
         self.min_chars = min_chars
+        self.protect_tools = frozenset(protect_tools)
 
     def _apply(self, messages, ctx, report):
         seen: dict[str, int] = {}
         out: list[Message] = []
+        names = _tool_names(messages) if self.protect_tools else {}
         for i, m in enumerate(messages):
+            if self.protect_tools and _tool_of(m, names) in self.protect_tools:
+                out.append(m)
+                continue
             if (
                 m.kind in (KIND_TEXT, KIND_TOOL_RESULT)
                 and not m.pinned
@@ -375,9 +419,11 @@ class CompactJson(Strategy):
         max_keys: int = 120,
         max_depth: int = 6,
         max_outliers: int = 10,
+        protect_tools: Sequence[str] = (),
         **kw: Any,
     ) -> None:
         super().__init__(**kw)
+        self.protect_tools = frozenset(protect_tools)
         self.max_outliers = max_outliers
         self.max_rows = max_rows
         self.max_keys = max_keys
@@ -385,8 +431,14 @@ class CompactJson(Strategy):
 
     def _apply(self, messages, ctx, report):
         out: list[Message] = []
+        names = _tool_names(messages) if self.protect_tools else {}
         for i, m in enumerate(messages):
-            if m.kind not in (KIND_TEXT, KIND_TOOL_RESULT) or m.pinned or is_opaque_message(m):
+            if (
+                m.kind not in (KIND_TEXT, KIND_TOOL_RESULT)
+                or m.pinned
+                or is_opaque_message(m)
+                or (self.protect_tools and _tool_of(m, names) in self.protect_tools)
+            ):
                 out.append(m)
                 continue
             compacted: str | None = None
@@ -473,7 +525,8 @@ def salient_lines(middle: str, budget_chars: int, max_lines: int = 20) -> list[t
         t = templates[i]
         if not t:
             continue
-        severe = bool(_SEVERITY_RE.search(lines[i]))
+        sev = _severity_score(lines[i])
+        severe = sev > 0
         rare = rarity_informative and counts[t] <= 2
         if not (severe or rare):
             continue
@@ -486,7 +539,7 @@ def salient_lines(middle: str, budget_chars: int, max_lines: int = 20) -> list[t
             text = text[:_LINE_CAP] + "…"
         if severe and counts[t] >= 3:
             text += f"  [x{counts[t]} similar]"
-        scored.append((-(2 * severe + rare), i, text))
+        scored.append((-(2 * sev + rare), i, text))
     scored.sort()
     chosen: list[tuple[int, str]] = []
     used = 0
@@ -525,11 +578,18 @@ class TruncateToolOutput(Strategy):
         include_retrieved_text: bool = False,
         salient: bool = True,
         salient_chars: int = 1200,
+        tool_limits: Mapping[str, int] | None = None,
         **kw: Any,
     ) -> None:
         super().__init__(**kw)
         if head_chars + tail_chars >= max_chars:
             raise ValueError("head_chars + tail_chars must be < max_chars")
+        self.tool_limits = dict(tool_limits or {})
+        for tool, lim in self.tool_limits.items():
+            if isinstance(lim, bool) or not isinstance(lim, int) or lim < 0 or 0 < lim < 300:
+                raise ValueError(
+                    f"tool_limits[{tool!r}] must be 0 (never shorten) or at least 300 characters"
+                )
         if salient_chars < 0:
             raise ValueError("salient_chars must be >= 0")
         self.salient = salient
@@ -547,23 +607,31 @@ class TruncateToolOutput(Strategy):
 
     def _apply(self, messages, ctx, report):
         out: list[Message] = []
+        names = _tool_names(messages) if self.tool_limits else {}
         for i, m in enumerate(messages):
+            max_chars, head_chars, tail_chars = self.max_chars, self.head_chars, self.tail_chars
+            tool = _tool_of(m, names) if self.tool_limits else None
+            if tool is not None and tool in self.tool_limits:
+                lim = self.tool_limits[tool]
+                max_chars = lim if lim else len(m.content)  # 0: never shorten this tool
+                head_chars = min(head_chars, max_chars // 3)
+                tail_chars = min(tail_chars, max_chars // 3)
             if (
                 not self._eligible(m)
                 or (m.pinned and not self.truncate_pinned)
                 or is_opaque_message(m)
-                or len(m.content) <= self.max_chars
+                or len(m.content) <= max_chars
             ):
                 out.append(m)
                 continue
-            head = m.content[: self.head_chars]
-            tail = m.content[-self.tail_chars :]
-            omitted = len(m.content) - self.head_chars - self.tail_chars
+            head = m.content[:head_chars]
+            tail = m.content[len(m.content) - tail_chars :]  # not [-0:], which is everything
+            omitted = len(m.content) - head_chars - tail_chars
             omitted_tokens = ctx.estimator.count(
-                m.content[self.head_chars : len(m.content) - self.tail_chars]
+                m.content[head_chars : len(m.content) - tail_chars]
             )
             marker = _marker(
-                f"truncated — kept {self.head_chars:,} head + {self.tail_chars:,} tail chars, "
+                f"truncated — kept {head_chars:,} head + {tail_chars:,} tail chars, "
                 f"omitted {omitted:,} chars (~{omitted_tokens:,} est. tokens)"
             )
             oid = ""
@@ -573,10 +641,10 @@ class TruncateToolOutput(Strategy):
                 marker = marker[:-1] + f" — full text id {oid}]"
             new_content = head + "\n" + marker + "\n" + tail
             if self.salient and self.salient_chars:
-                middle = m.content[self.head_chars : len(m.content) - self.tail_chars]
+                middle = m.content[head_chars : len(m.content) - tail_chars]
                 picked = salient_lines(middle, self.salient_chars)
                 if picked:
-                    base = m.content[: self.head_chars].count("\n") + 1
+                    base = m.content[:head_chars].count("\n") + 1
                     body = "\n".join(f"L{base + i}: {text}" for i, text in picked)
                     note = _marker(
                         f"kept {len(picked)} salient line(s) from the omitted middle "

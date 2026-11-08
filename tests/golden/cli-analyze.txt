@@ -1,0 +1,20 @@
+ctxfit analyze  [pieces]  budget 1,500 est. tokens
+messages: 7   total used: 8,769 est. tokens
+
+section     used (est)      budget   status
+system               7         150       ok
+retrieved        8,738         825     OVER
+history             24         375       ok
+scratchpad           0         150       ok
+
+warnings:
+  ! section 'retrieved' over budget: 8,738 est. tokens used vs 825 allowed (over by 7,913)
+
+top 7 messages by est. tokens:
+  #3       4,369  tool/tool_result [retrieved]  line 0 ok line 1 ok line 2 ok line 3 ok line 4 ok line 5 ok line 6 ok line 7 ok …
+  #5       4,369  tool/tool_result [retrieved]  line 0 ok line 1 ok line 2 ok line 3 ok line 4 ok line 5 ok line 6 ok line 7 ok …
+  #0           7  system/text [system]  Be brief.
+  #6           7  user/text [history]  and now?
+  #2           6  assistant/tool_call [history]  {}
+  #4           6  assistant/tool_call [history]  {}
+  #1           5  user/text [history]  go

@@ -23,9 +23,12 @@ from .messages import (
 from .strategies import (
     AGGRESSIVE_STRATEGIES,
     DEFAULT_STRATEGIES,
+    CompactJson,
+    Deduplicate,
     Strategy,
     StrategyContext,
     StrategyReport,
+    TruncateToolOutput,
 )
 
 
@@ -185,6 +188,23 @@ def _audit_facts(
     return len(seen), lost
 
 
+def _with_tool_limits(
+    strategies: Sequence[Strategy], tool_limits: Mapping[str, int]
+) -> list[Strategy]:
+    """The default strategies, set up with per-tool limits (0 = leave that tool's output alone)."""
+    never = [t for t, n in tool_limits.items() if n == 0]
+    out: list[Strategy] = []
+    for st in strategies:
+        if isinstance(st, TruncateToolOutput):
+            st = TruncateToolOutput(tool_limits=tool_limits)
+        elif isinstance(st, CompactJson):
+            st = CompactJson(protect_tools=never)
+        elif isinstance(st, Deduplicate):
+            st = Deduplicate(protect_tools=never)
+        out.append(st)
+    return out
+
+
 class PairingBroken(Exception):
     """A strategy violated the tool_call/tool_result pairing invariant."""
 
@@ -202,15 +222,23 @@ class FitPipeline:
         audit_facts: bool = False,
         offload: MutableMapping[str, str] | None = None,
         pairing: str = "strict",
+        tool_limits: Mapping[str, int] | None = None,
     ) -> None:
         if pairing not in ("strict", "repair"):
             raise ValueError(f"unknown pairing mode {pairing!r}; expected 'strict' or 'repair'")
         self.pairing = pairing
         self.audit_facts = audit_facts
         self.offload = offload
+        if tool_limits and strategies is not None:
+            raise ValueError(
+                "tool_limits works with the default strategies; with your own list, give "
+                "TruncateToolOutput(tool_limits=...) yourself"
+            )
         if strategies is None:
             kinds = AGGRESSIVE_STRATEGIES if aggressive else DEFAULT_STRATEGIES
             strategies = [k() for k in kinds]
+            if tool_limits:
+                strategies = _with_tool_limits(strategies, tool_limits)
         self.strategies: list[Strategy] = [s() if isinstance(s, type) else s for s in strategies]
         self.estimator = get_estimator(estimator)
         self.budget = budget or Budget()
@@ -350,6 +378,7 @@ def fit(
     audit_facts: bool = False,
     offload: MutableMapping[str, str] | None = None,
     pairing: str = "strict",
+    tool_limits: Mapping[str, int] | None = None,
 ) -> tuple[list[Any], FitReport]:
     """One-call API: fit raw messages within budget.
 
@@ -362,6 +391,11 @@ def fit(
 
     pairing: ``"strict"`` (default) raises :class:`PairingBroken` when a tool call has no result
     or the reverse; ``"repair"`` drops those unmatched messages first and says so in the report.
+
+    tool_limits: per-tool control of the default strategies, ``{"tool name": n}``. ``0`` means
+    never shorten, compact or de-duplicate that tool's output (use it for the file you are
+    editing); ``n`` (at least 300) is the character limit for that tool instead of 4,000. Old
+    turns can still be dropped by the sliding window. Not combinable with a custom strategy list.
 
     Note: token figures are estimates (heuristic ±~25%). Budget 80-90% of
     your model's true context window as a safety margin.
@@ -385,5 +419,6 @@ def fit(
         audit_facts=audit_facts,
         offload=offload,
         pairing=pairing,
+        tool_limits=tool_limits,
     )
     return pipeline.fit(raw, flavor=flavor)

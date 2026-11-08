@@ -1,0 +1,60 @@
+{
+  "estimator": "pieces",
+  "total_budget": 1500,
+  "tokens_before": {
+    "system": 7,
+    "retrieved": 8738,
+    "history": 24,
+    "scratchpad": 0
+  },
+  "tokens_after": {
+    "system": 7,
+    "retrieved": 859,
+    "history": 24,
+    "scratchpad": 0
+  },
+  "total_before": 8769,
+  "total_after": 890,
+  "saved_est": 7879,
+  "savings_pct": 89.85,
+  "over_budget": true,
+  "facts_seen": null,
+  "facts_lost_count": 0,
+  "facts_lost": [],
+  "passthrough_messages": 0,
+  "pairing_repaired": 0,
+  "pairing_repairs": [],
+  "warnings": [
+    "section 'retrieved' over budget: 859 est. tokens used vs 825 allowed (over by 34)"
+  ],
+  "strategies": [
+    {
+      "strategy": "deduplicate",
+      "saved_tokens_est": 4347,
+      "messages_affected": 1,
+      "actions": [
+        "deduped message #5 (identical to #3)"
+      ]
+    },
+    {
+      "strategy": "compact_json",
+      "saved_tokens_est": 0,
+      "messages_affected": 0,
+      "actions": []
+    },
+    {
+      "strategy": "truncate_tool_output",
+      "saved_tokens_est": 3532,
+      "messages_affected": 1,
+      "actions": [
+        "truncated message #3: 11,705 \u2192 2,500 chars"
+      ]
+    },
+    {
+      "strategy": "sliding_window",
+      "saved_tokens_est": 0,
+      "messages_affected": 0,
+      "actions": []
+    }
+  ]
+}

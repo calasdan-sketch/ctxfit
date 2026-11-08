@@ -1,0 +1,69 @@
+{
+  "estimator": "pieces",
+  "total_budget": 1500,
+  "allowances": {
+    "system": 150,
+    "retrieved": 825,
+    "history": 375,
+    "scratchpad": 150
+  },
+  "usage_est": {
+    "system": 0,
+    "retrieved": 4369,
+    "history": 27,
+    "scratchpad": 0
+  },
+  "total_used_est": 4396,
+  "over_budget": true,
+  "warnings": [
+    "section 'retrieved' over budget: 4,369 est. tokens used vs 825 allowed (over by 3,544)"
+  ],
+  "top_consumers": [
+    {
+      "index": 3,
+      "role": "user",
+      "kind": "tool_result",
+      "section": "retrieved",
+      "est_tokens": 4369,
+      "chars": 11705,
+      "preview": "line 0 ok line 1 ok line 2 ok line 3 ok line 4 ok line 5 ok line 6 ok line 7 ok \u2026"
+    },
+    {
+      "index": 2,
+      "role": "assistant",
+      "kind": "tool_call",
+      "section": "history",
+      "est_tokens": 11,
+      "chars": 17,
+      "preview": "{\"command\": \"ls\"}"
+    },
+    {
+      "index": 4,
+      "role": "user",
+      "kind": "text",
+      "section": "history",
+      "est_tokens": 6,
+      "chars": 4,
+      "preview": "and?"
+    },
+    {
+      "index": 0,
+      "role": "user",
+      "kind": "text",
+      "section": "history",
+      "est_tokens": 5,
+      "chars": 2,
+      "preview": "go"
+    },
+    {
+      "index": 1,
+      "role": "assistant",
+      "kind": "text",
+      "section": "history",
+      "est_tokens": 5,
+      "chars": 2,
+      "preview": "ok"
+    }
+  ],
+  "message_count": 5
+}

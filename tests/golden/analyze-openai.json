@@ -1,0 +1,87 @@
+{
+  "estimator": "pieces",
+  "total_budget": 1500,
+  "allowances": {
+    "system": 150,
+    "retrieved": 825,
+    "history": 375,
+    "scratchpad": 150
+  },
+  "usage_est": {
+    "system": 7,
+    "retrieved": 8738,
+    "history": 24,
+    "scratchpad": 0
+  },
+  "total_used_est": 8769,
+  "over_budget": true,
+  "warnings": [
+    "section 'retrieved' over budget: 8,738 est. tokens used vs 825 allowed (over by 7,913)"
+  ],
+  "top_consumers": [
+    {
+      "index": 3,
+      "role": "tool",
+      "kind": "tool_result",
+      "section": "retrieved",
+      "est_tokens": 4369,
+      "chars": 11705,
+      "preview": "line 0 ok line 1 ok line 2 ok line 3 ok line 4 ok line 5 ok line 6 ok line 7 ok \u2026"
+    },
+    {
+      "index": 5,
+      "role": "tool",
+      "kind": "tool_result",
+      "section": "retrieved",
+      "est_tokens": 4369,
+      "chars": 11705,
+      "preview": "line 0 ok line 1 ok line 2 ok line 3 ok line 4 ok line 5 ok line 6 ok line 7 ok \u2026"
+    },
+    {
+      "index": 0,
+      "role": "system",
+      "kind": "text",
+      "section": "system",
+      "est_tokens": 7,
+      "chars": 9,
+      "preview": "Be brief."
+    },
+    {
+      "index": 6,
+      "role": "user",
+      "kind": "text",
+      "section": "history",
+      "est_tokens": 7,
+      "chars": 8,
+      "preview": "and now?"
+    },
+    {
+      "index": 2,
+      "role": "assistant",
+      "kind": "tool_call",
+      "section": "history",
+      "est_tokens": 6,
+      "chars": 2,
+      "preview": "{}"
+    },
+    {
+      "index": 4,
+      "role": "assistant",
+      "kind": "tool_call",
+      "section": "history",
+      "est_tokens": 6,
+      "chars": 2,
+      "preview": "{}"
+    },
+    {
+      "index": 1,
+      "role": "user",
+      "kind": "text",
+      "section": "history",
+      "est_tokens": 5,
+      "chars": 2,
+      "preview": "go"
+    }
+  ],
+  "message_count": 7
+}
