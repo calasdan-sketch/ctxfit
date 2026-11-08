@@ -44,7 +44,12 @@ MUTANTS: list[tuple[str, str, str, str]] = [
         'if m.section == "system" or t == latest:',
         "",
     ),
-    ("src/ctxfit/strategies.py", "if after >= before:", "if after > before:", ""),
+    (
+        "src/ctxfit/strategies.py",
+        "if after >= before:",
+        "if after > before:",
+        "tie: JSON and table of exactly equal estimated size; either choice is as good",
+    ),
     ("src/ctxfit/strategies.py", "if len(candidate) < len(m.content):", "if True:", ""),
     (
         "src/ctxfit/strategies.py",
